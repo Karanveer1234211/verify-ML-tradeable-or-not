@@ -1144,6 +1144,21 @@ def build_5d_rank_quant_labels(panel: pd.DataFrame, ev_target: str = "cc") -> pd
     )
     panel["atr_pct"] = (pd.to_numeric(panel["D_atr14"], errors="coerce") / pd.to_numeric(panel["close"], errors="coerce")).replace([np.inf,-np.inf],np.nan) * 100.0
     vol_basis = panel["vol_20"].fillna(panel["atr_pct"]).replace(0.0, np.nan)
+    # ROBUSTNESS FIX (vol-adjustment blow-up): a near-zero-volatility name makes
+    # ret_*_adj = ret / vol_basis explode. That single artifact drove the top
+    # calibration decile's exp_sharpe_5d to ~4.85 while every other decile sat in
+    # [-1.0, +0.4], and it also distorts the isotonic EV mapper (fit on ret_5d_adj).
+    # Floor vol_basis at each trading day's 5th percentile so the adjustment cannot
+    # divide by a pathologically small number. Top/bottom-20% membership is
+    # essentially unchanged (the affected names are micro-vol outliers that should
+    # not receive implicit 20-30x leverage in the adjusted return).
+    _vb_floor = (
+        vol_basis.groupby(panel["date"]).transform(
+            lambda s: np.nanpercentile(s, 5)
+            if np.isfinite(s.to_numpy(dtype="float64")).any() else 0.0
+        ).fillna(0.0)
+    )
+    vol_basis = np.maximum(vol_basis, _vb_floor)
     if ev_target == "oc":
         r5 = pd.to_numeric(panel["ret_5d_oc_pct"], errors="coerce")
         r3 = pd.to_numeric(panel["ret_3d_oc_pct"], errors="coerce")
@@ -1838,7 +1853,20 @@ def _fit_member_from_arrays(prepared: dict, seed: int,
     X = prepared["X"]; y = prepared["y"]
     i_train = prepared["i_train"]; i_cal = prepared["i_cal"]; i_test = prepared["i_test"]
 
-    base = _LGB(**_lgbm_cls_params(seed))
+    # ENSEMBLE DIVERSITY FIX: previously the N members differed ONLY by their RNG
+    # seed, so they trained near-identical trees. In the actual run the 5 fallback
+    # members agreed to the 4th decimal (val logloss 0.67567 / 0.67572 / 0.67568 /
+    # 0.67581 / 0.67569), which means averaging them reduced variance by ~nothing
+    # while costing 5x the compute. Give each member a genuinely different
+    # structural config (num_leaves / feature_fraction / min_data_in_leaf), seeded
+    # deterministically from `seed` so runs remain byte-reproducible. Real member
+    # diversity is what lets the ensemble average actually lower OOS error.
+    _params = _lgbm_cls_params(seed)
+    _mrng = np.random.RandomState(int(seed) % (2**31 - 1))
+    _params["num_leaves"] = int(_mrng.choice([24, 31, 48, 63]))
+    _params["feature_fraction"] = float(_mrng.choice([0.6, 0.7, 0.8]))
+    _params["min_data_in_leaf"] = int(_mrng.choice([300, 500, 800]))
+    base = _LGB(**_params)
     callbacks = _lgb_callbacks(len(i_cal))
     base.fit(X.iloc[i_train], y.iloc[i_train],
              eval_set=[(X.iloc[i_cal], y.iloc[i_cal])], eval_metric="binary_logloss",
@@ -1889,13 +1917,20 @@ def _build_calib_table_from_oos(oos_df: pd.DataFrame) -> dict:
                                      q=min(10, max(3, df_oos.shape[0]//50)),
                                      labels=False, duplicates="drop")
     calib = (df_oos.groupby("prob_bucket")
-        .agg(avg_ret_3d=("ret_3d_close_pct", "mean"),
+        .agg(avg_prob=("prob_top20_5d", "mean"),
+             avg_ret_3d=("ret_3d_close_pct", "mean"),
              avg_ret_5d=("ret_5d_close_pct", "mean"),
              std_ret_5d=("ret_5d_close_pct", "std"),
-             avg_ret_5d_adj=("ret_5d_adj", "mean"))
+             avg_ret_5d_adj=("ret_5d_adj", "median"))
         .reset_index().sort_values("prob_bucket"))
-    probs = np.linspace(0.05, 0.95, len(calib)) if len(calib) >= 3 else np.array([0.05, 0.5, 0.95])
-    calib["prob_mid"] = probs
+    # CORRECTNESS FIX: prob_mid must be the ACTUAL mean predicted probability in
+    # each bucket, not a synthetic np.linspace(0.05, 0.95, ...). map_prob_to_expectations
+    # interpolates expected returns against prob_mid, so the old synthetic grid
+    # silently mapped a model probability to the WRONG expected return (e.g. a true
+    # 0.62 was read off the table as if it were ~0.55). exp_sharpe_5d now uses the
+    # per-bucket MEDIAN vol-adjusted return so a few residual outliers cannot blow
+    # up a decile (this is what produced the 4.85 top-decile Sharpe artifact).
+    calib["prob_mid"] = calib["avg_prob"].astype(float)
     calib["exp_sharpe_5d"] = calib["avg_ret_5d_adj"].astype(float)
     return {
         "prob_mid": calib["prob_mid"].tolist(),
@@ -2489,13 +2524,16 @@ def run_pipeline(*,
     df_oos = oos_df.dropna(subset=["prob_top20_5d"]).copy()
     df_oos["prob_bucket"] = pd.qcut(df_oos["prob_top20_5d"], q=min(10, max(3, df_oos.shape[0]//50)), labels=False, duplicates="drop")
     calib = (df_oos.groupby("prob_bucket")
-        .agg(avg_ret_3d=("ret_3d_close_pct","mean"),
+        .agg(avg_prob=("prob_top20_5d","mean"),
+             avg_ret_3d=("ret_3d_close_pct","mean"),
              avg_ret_5d=("ret_5d_close_pct","mean"),
              std_ret_5d=("ret_5d_close_pct","std"),
-             avg_ret_5d_adj=("ret_5d_adj","mean"))
+             avg_ret_5d_adj=("ret_5d_adj","median"))
         .reset_index().sort_values("prob_bucket"))
-    probs = np.linspace(0.05, 0.95, len(calib)) if len(calib) >= 3 else np.array([0.05, 0.5, 0.95])
-    calib["prob_mid"] = probs
+    # CORRECTNESS FIX: use the real mean predicted probability per bucket for
+    # prob_mid (was a synthetic np.linspace grid) and a robust MEDIAN for the
+    # vol-adjusted return. See _build_calib_table_from_oos for the full rationale.
+    calib["prob_mid"] = calib["avg_prob"].astype(float)
     calib["exp_sharpe_5d"] = calib["avg_ret_5d_adj"].astype(float)
     calib_table = {
         "prob_mid": calib["prob_mid"].tolist(),
