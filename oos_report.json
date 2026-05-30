@@ -1,0 +1,10 @@
+{
+  "5d_cls": {
+    "n_oos": 188742,
+    "brier_pseudo": 0.2407489888408535,
+    "spearman_ic_5d_adj": 0.1581975613044033,
+    "spearman_ic_pvalue": 0.0,
+    "ev_target": "oc",
+    "embargo_days": 5
+  }
+}
