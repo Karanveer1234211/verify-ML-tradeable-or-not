@@ -127,6 +127,29 @@ CHUNK_SIZE = 1200
 MODEL_ARCHITECTURE = "both"          # "single" | "regime" | "both"
 PRIMARY_ARCHITECTURE = "single"      # which one to EXPORT/score when "both"
 
+# =====================================================================
+# TARGET_MODE  — what the 5D model learns.
+# =====================================================================
+# "binary" -> ORIGINAL behavior. Label = top-20% vs bottom-20% of the per-day
+#             vol-adjusted forward 5d return. The middle 60% of rows are DROPPED
+#             (unlabeled), so the model only ever sees the extremes at train time
+#             yet is asked to score every row at inference. Proven, default.
+# "rank"   -> NEW. Label = the CONTINUOUS per-day cross-sectional rank percentile
+#             (rank_5d_pct in [0,1]) of the vol-adjusted forward 5d return, trained
+#             with a LightGBM REGRESSION objective on ALL labeled rows (~3x the
+#             data). This directly optimizes the cross-sectional ordering, which is
+#             exactly what Spearman IC measures. The regressor's raw score is mapped
+#             back to a P(top-20%) probability via an isotonic fit on the embargoed
+#             CAL slice, so EVERY downstream consumer (EnsembleCalibrator,
+#             RegimeRouter, calibration deciles, isotonic EV mapper, watchlist,
+#             EVShim export) keeps working UNCHANGED — a rank member quacks exactly
+#             like the old calibrated classifier (predict_proba -> [P(no), P(yes)]).
+#
+# Recommended: run once with "binary" and once with "rank" and compare the OOS IC
+# in oos_report.json / architecture_comparison.json on the SAME embargoed rows.
+TARGET_MODE = "rank"                 # "binary" | "rank"
+RANK_OBJECTIVE = "regression"        # LightGBM objective used when TARGET_MODE="rank"
+
 # Use the strict follow-through label (close>=entry AND max drawdown<3% over 5d)?
 USE_STRICT_LABEL = False
 
@@ -1318,6 +1341,36 @@ def _lgbm_cls_params(rnd: int):
     )
     return params
 
+def _lgbm_rank_params(rnd: int):
+    """Hyperparameters for TARGET_MODE='rank' (LightGBM regression on the per-day
+    rank percentile). Mirrors _lgbm_cls_params but with a regression objective and
+    NO class_weight (LGBMRegressor does not accept it)."""
+    depth = MAX_DEPTH if isinstance(MAX_DEPTH, int) and MAX_DEPTH > 0 else -1
+    params = dict(
+        objective=str(RANK_OBJECTIVE),
+        metric="l2",
+        n_estimators=3000,
+        learning_rate=LEARNING_RATE,
+        num_leaves=31,
+        max_depth=depth,
+        feature_fraction=0.7,
+        bagging_fraction=0.7,
+        bagging_freq=1,
+        min_data_in_leaf=500,
+        min_gain_to_split=0.02,
+        max_bin=255,
+        reg_alpha=0.3,
+        reg_lambda=10.0,
+        extra_trees=True,
+        n_jobs=-1,
+        random_state=int(rnd),
+        verbosity=-1,
+        feature_fraction_seed=int(rnd),
+        bagging_seed=int(rnd),
+        data_random_seed=int(rnd),
+    )
+    return params
+
 def _lgb_callbacks(val_size: int):
     import lightgbm as _lgb_mod
     cbs = [_lgb_mod.callback.log_evaluation(period=0)]
@@ -1393,9 +1446,51 @@ def train_5d_quantile_cls(panel: pd.DataFrame, feats: List[str], ev_target: str,
 
 # ===================== Final Train → Calibrate → Test (EV mapper fixed) =====================
 
+def _persist_feature_schema(feats: List[str], impute_stats: Dict[str, float]):
+    """Create or non-destructively update features_train.json. Factored out so the
+    rank-mode path saves the schema with the same semantics as the binary path."""
+    if Path(FEATURES_SCHEMA_PATH).exists():
+        existing_feats, existing_impute = load_schema(FEATURES_SCHEMA_PATH)
+        new_feats = [f for f in feats if f not in existing_feats]
+        if new_feats:
+            print(f"[Schema] Detected {len(new_feats)} NEW features in panel:")
+            for nf in new_feats[:20]:
+                print(f"          + {nf}")
+            if len(new_feats) > 20:
+                print(f"          ... and {len(new_feats) - 20} more")
+            merged_impute = dict(existing_impute)
+            merged_impute.update(impute_stats)
+            save_schema(FEATURES_SCHEMA_PATH, feats, merged_impute)
+            print(f"[Schema] Updated: {len(feats)} total features")
+        else:
+            print(f"[Schema] No new features. Using existing {len(existing_feats)} features")
+    else:
+        save_schema(FEATURES_SCHEMA_PATH, feats, impute_stats)
+        print(f"[Schema] Created features_train.json with {len(feats)} features")
+
+
+def _fit_final_rank(panel: pd.DataFrame, feats: List[str], ev_target: str,
+                    early_stopping_rounds: int = EARLY_STOPPING_ROUNDS):
+    """TARGET_MODE='rank' counterpart of fit_final_model_and_oos_calibration.
+    Reuses the shared prepared-arrays + member machinery so oos_report.json and
+    calibration_5d_deciles.json reflect the SAME regression objective + score->prob
+    calibration that the deployed ensemble uses."""
+    _check_lightgbm()
+    prepared = _prepare_training_arrays(panel, feats, ev_target, use_strict_label=USE_STRICT_LABEL)
+    _persist_feature_schema(feats, prepared["impute_stats"])
+    member, iso_ev, oos_df = _fit_member_from_arrays(
+        prepared, seed=GLOBAL_SEED + 777,
+        early_stopping_rounds=early_stopping_rounds, skip_oos_artifacts=False)
+    print(f"[Final] TARGET_MODE='rank': trained regression model on "
+          f"{len(prepared['i_train']):,} rows (all-row rank target).")
+    return member, iso_ev, oos_df
+
+
 def fit_final_model_and_oos_calibration(panel: pd.DataFrame, feats: List[str], ev_target: str,
                                         early_stopping_rounds: int = EARLY_STOPPING_ROUNDS):
     lgb, LGBMClassifier = _check_lightgbm()
+    if str(TARGET_MODE).lower() == "rank":
+        return _fit_final_rank(panel, feats, ev_target, early_stopping_rounds)
     pl = build_5d_rank_quant_labels(panel, ev_target=ev_target)
     y = pl["top20_vs_bot20_5d"].astype("float")
     mask = y.notna()
@@ -1534,6 +1629,53 @@ def train_1d_followthrough(panel: pd.DataFrame, feats: List[str], margin_pct: fl
 REGIMES = ["bull_trend", "bull_range", "bear_trend", "bear_range"]
 ENSEMBLE_SIZE_PER_REGIME = 5
 MIN_ROWS_PER_REGIME = 5000  # minimum labeled rows to train a regime model
+
+
+class RankProbaModel:
+    """
+    TARGET_MODE='rank' member. Wraps a LightGBM REGRESSOR (trained on the per-day
+    rank percentile, all rows) plus an isotonic map score -> P(top-20%), and
+    exposes the SAME predict_proba/predict interface as the binary calibrated
+    classifier so it is a drop-in member for EnsembleCalibrator / RegimeRouter /
+    the watchlist / the EVShim export. Pickle-safe (module-level class).
+
+    feature_list mirrors EnsembleCalibrator: when set, X is reindexed to those
+    columns before predicting. Members usually carry feature_list=None and let the
+    enclosing EnsembleCalibrator project, exactly like the binary members.
+    """
+    def __init__(self, regressor, score_to_prob, feature_list=None):
+        self.regressor = regressor
+        self.score_to_prob = score_to_prob  # fitted sklearn IsotonicRegression
+        self.feature_list = list(feature_list) if feature_list is not None else None
+
+    def _project(self, X):
+        feature_list = getattr(self, "feature_list", None)
+        if feature_list is None:
+            return X
+        try:
+            return X.reindex(columns=feature_list)
+        except Exception:
+            return X
+
+    def _scores_to_proba(self, scores):
+        scores = np.asarray(scores, dtype=float)
+        s2p = getattr(self, "score_to_prob", None)
+        if s2p is None:
+            # No calibrator: min-max the score into (0,1) as a last resort.
+            lo, hi = np.nanmin(scores), np.nanmax(scores)
+            p = (scores - lo) / (hi - lo) if hi > lo else np.full_like(scores, 0.5)
+        else:
+            p = np.asarray(s2p.predict(scores), dtype=float)
+        return np.clip(p, 1e-6, 1.0 - 1e-6)
+
+    def predict_proba(self, X):
+        Xp = self._project(X)
+        scores = self.regressor.predict(Xp)
+        p = self._scores_to_proba(scores)
+        return np.column_stack([1.0 - p, p])
+
+    def predict(self, X):
+        return self.predict_proba(X)[:, 1] >= 0.5
 
 
 class EnsembleCalibrator:
@@ -1812,12 +1954,22 @@ def _prepare_training_arrays(panel: pd.DataFrame, feats: List[str], ev_target: s
         pl = pl.merge(strict_map, on=["timestamp", "symbol"], how="left", suffixes=("", "_strict"))
         if "top20_strict_5d" in pl.columns:
             pl["top20_vs_bot20_5d"] = pl["top20_strict_5d"]
-    y_all = pl["top20_vs_bot20_5d"].astype("float")
-    mask = y_all.notna()
+    # Binary indicator is always kept (rank mode uses it only to calibrate the
+    # regressor's score -> P(top-20%) on the embargoed CAL slice).
+    bin_all = pl["top20_vs_bot20_5d"].astype("float")
+    mode = str(TARGET_MODE).lower()
+    if mode == "rank":
+        # CONTINUOUS target on ALL labeled rows (~3x data): the per-day
+        # cross-sectional rank percentile of the vol-adjusted forward 5d return.
+        target_all = pd.to_numeric(pl["rank_5d_pct"], errors="coerce")
+        mask = target_all.notna() & pd.to_numeric(pl["ret_5d_adj"], errors="coerce").notna()
+    else:
+        target_all = bin_all
+        mask = bin_all.notna()
     if not mask.any():
-        raise ValueError("No labels for 5D quantile classification.")
+        raise ValueError("No labels for 5D target (mode=%r)." % mode)
     X = sanitize_feature_matrix(pl.loc[mask].reindex(columns=feats).copy())
-    y = y_all.loc[mask].astype(int)
+    y = target_all.loc[mask].astype(float) if mode == "rank" else target_all.loc[mask].astype(int)
     t = pl.loc[mask, "timestamp"].values
     # FIXES 2 & 3: day-aligned, embargoed split (was contiguous positional split).
     i_train, i_cal, i_test = split_train_cal_test_by_date(
@@ -1827,9 +1979,11 @@ def _prepare_training_arrays(panel: pd.DataFrame, feats: List[str], ev_target: s
             t, train_frac=0.70, cal_frac=0.20, embargo_days=0)
     impute_stats = compute_impute_stats(X.iloc[i_train])
     pl_masked = pl.loc[mask]
+    bin_masked = bin_all.loc[mask].to_numpy(dtype=float)  # NaN for the middle 60% in rank mode
     return {
-        "X": X, "y": y,
+        "X": X, "y": y, "mode": mode,
         "i_train": i_train, "i_cal": i_cal, "i_test": i_test,
+        "y_bin_cal": bin_masked[i_cal],   # binary {0,1,NaN} for score->prob calibration
         "ret_5d_adj_cal": pl_masked.iloc[i_cal]["ret_5d_adj"].astype(float).values,
         "ret_3d_test": pl_masked.iloc[i_test]["ret_3d_close_pct"].values,
         "ret_5d_test": pl_masked.iloc[i_test]["ret_5d_close_pct"].values,
@@ -1861,11 +2015,57 @@ def _fit_member_from_arrays(prepared: dict, seed: int,
     # structural config (num_leaves / feature_fraction / min_data_in_leaf), seeded
     # deterministically from `seed` so runs remain byte-reproducible. Real member
     # diversity is what lets the ensemble average actually lower OOS error.
-    _params = _lgbm_cls_params(seed)
+    mode = prepared.get("mode", "binary")
     _mrng = np.random.RandomState(int(seed) % (2**31 - 1))
-    _params["num_leaves"] = int(_mrng.choice([24, 31, 48, 63]))
-    _params["feature_fraction"] = float(_mrng.choice([0.6, 0.7, 0.8]))
-    _params["min_data_in_leaf"] = int(_mrng.choice([300, 500, 800]))
+    _div = dict(
+        num_leaves=int(_mrng.choice([24, 31, 48, 63])),
+        feature_fraction=float(_mrng.choice([0.6, 0.7, 0.8])),
+        min_data_in_leaf=int(_mrng.choice([300, 500, 800])),
+    )
+
+    # ---- TARGET_MODE='rank': LightGBM regression on the per-day rank percentile ----
+    if mode == "rank":
+        from lightgbm import LGBMRegressor as _LGBR
+        from sklearn.isotonic import IsotonicRegression as _Iso
+        _rp = _lgbm_rank_params(seed); _rp.update(_div)
+        reg = _LGBR(**_rp)
+        callbacks = _lgb_callbacks(len(i_cal))
+        reg.fit(X.iloc[i_train], y.iloc[i_train],
+                eval_set=[(X.iloc[i_cal], y.iloc[i_cal])], eval_metric="l2",
+                callbacks=callbacks)
+        # Calibrate the regressor's raw score -> P(top-20%) on the CAL rows that
+        # carry a binary label (the extremes). Isotonic keeps p monotonic in score
+        # so the rank member's predict_proba is comparable to the binary member's.
+        s_cal = np.asarray(reg.predict(X.iloc[i_cal]), dtype=float)
+        y_bin_cal = np.asarray(prepared.get("y_bin_cal"), dtype=float)
+        ok = np.isfinite(s_cal) & np.isfinite(y_bin_cal)
+        score_to_prob = _Iso(out_of_bounds="clip")
+        if int(ok.sum()) >= 50 and len(np.unique(y_bin_cal[ok])) > 1:
+            score_to_prob.fit(s_cal[ok], y_bin_cal[ok])
+        else:
+            # Degenerate fallback: calibrate against the score's own percentile rank.
+            score_to_prob.fit(s_cal, pd.Series(s_cal).rank(pct=True).to_numpy())
+        member = RankProbaModel(reg, score_to_prob, feature_list=None)
+        if skip_oos_artifacts:
+            return member, None, None
+        p_cal = np.clip(score_to_prob.predict(s_cal), 1e-6, 1.0 - 1e-6)
+        iso_ev = fit_isotonic_ev_mapper(p_cal, prepared["ret_5d_adj_cal"])
+        s_test = np.asarray(reg.predict(X.iloc[i_test]), dtype=float)
+        p_test = np.clip(score_to_prob.predict(s_test), 1e-6, 1.0 - 1e-6)
+        ev_test = iso_ev.predict(p_test)
+        oos_df = pd.DataFrame({
+            "prob_top20_5d": p_test,
+            "ret_3d_close_pct": prepared["ret_3d_test"],
+            "ret_5d_close_pct": prepared["ret_5d_test"],
+            "ret_5d_adj": prepared["ret_5d_adj_test"],
+            "rank_5d_pct": prepared["rank_test"],
+            "expected_ret_5d_adj_iso": ev_test,
+        })
+        return member, iso_ev, oos_df
+
+    # ---- TARGET_MODE='binary' (original path, unchanged) ----
+    _params = _lgbm_cls_params(seed)
+    _params.update(_div)
     base = _LGB(**_params)
     callbacks = _lgb_callbacks(len(i_cal))
     base.fit(X.iloc[i_train], y.iloc[i_train],
