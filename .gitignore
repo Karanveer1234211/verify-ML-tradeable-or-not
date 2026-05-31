@@ -11,3 +11,21 @@ strategy_lab_top.csv
 
 # edge_finder.py generated output
 edge_finder_results.csv
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Edge finder / research outputs
+edge_finder_out/
+edge_selftest_out/
+edge_out*/
+*.sqlite
+
+# Local caches / tokens (never commit secrets or large parquet caches)
+kite_token.json
+instrument_cache.json
+cache_daily*/
+*_daily.parquet
+*_daily.ok.json

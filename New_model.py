@@ -1378,6 +1378,40 @@ def _lgb_callbacks(val_size: int):
         cbs.insert(0, _lgb_mod.callback.early_stopping(stopping_rounds=int(EARLY_STOPPING_ROUNDS)))
     return cbs
 
+
+def _fit_binary_cls_safe(clf, X_tr, y_tr, X_val, y_val, eval_metric="binary_logloss"):
+    """Robustly fit a LightGBM binary classifier against degenerate CV folds.
+
+    LightGBM's sklearn wrapper fits a LabelEncoder on y_tr. When the per-day
+    cross-section is thin, the top/bottom-quantile label collapses to a SINGLE
+    class across an early time window — a day with <5 labeled names can only
+    ever produce class 1 (the top), never class 0 (the bottom). The encoder
+    then raises "y contains previously unseen labels: [0]" the moment the
+    eval/test set carries the missing class.
+
+    Strategy:
+      * skip the fold (return False) if y_tr has < 2 classes;
+      * drop eval rows whose label is absent from y_tr; if the eval set
+        collapses entirely, fit without it (hence without early stopping).
+    Returns True if the model was fit, False if the fold should be skipped.
+    """
+    tr_classes = np.unique(np.asarray(y_tr))
+    if tr_classes.size < 2:
+        return False
+    yv = np.asarray(y_val)
+    keep = np.isin(yv, tr_classes)
+    if len(yv) > 0 and keep.all():
+        clf.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], eval_metric=eval_metric,
+                callbacks=_lgb_callbacks(len(yv)))
+    elif keep.any():
+        pos = np.flatnonzero(keep)
+        Xv = X_val.iloc[pos] if hasattr(X_val, "iloc") else np.asarray(X_val)[pos]
+        clf.fit(X_tr, y_tr, eval_set=[(Xv, yv[keep])], eval_metric=eval_metric,
+                callbacks=_lgb_callbacks(int(keep.sum())))
+    else:
+        clf.fit(X_tr, y_tr, callbacks=_lgb_callbacks(0))
+    return True
+
 # ===================== Calibration helpers =====================
 
 def _calibrate_best_brier(est, X_val, y_val):
@@ -1415,6 +1449,25 @@ def train_5d_quantile_cls(panel: pd.DataFrame, feats: List[str], ev_target: str,
     mask = y.notna()
     if not mask.any():
         raise ValueError("No labeled rows for 5D quantile classification (top/bottom 20%).")
+
+    # Cross-section breadth diagnostic. The per-day top/bottom-20% label needs
+    # >= 5 names on a day to yield BOTH classes; with fewer names only class 1
+    # (the top) appears, which makes early CV folds collapse to a single class.
+    _names_per_day = pl.loc[mask].groupby(pl.loc[mask, "date"]).size()
+    if len(_names_per_day):
+        _med = float(np.median(_names_per_day.values))
+        _thin = int((_names_per_day < 5).sum())
+        print(f"[5D-CLS] cross-section breadth: median names/day={_med:.0f}, "
+              f"days with <5 names={_thin}/{len(_names_per_day)} "
+              f"({100.0 * _thin / max(len(_names_per_day), 1):.0f}%), "
+              f"symbols={pl.loc[mask, 'symbol'].nunique()}")
+        if _med < 8:
+            print("[5D-CLS][WARN] Thin cross-section: the top/bottom-20% label is a "
+                  "per-day cross-sectional bucket and needs >=5 names/day to produce "
+                  "both classes. With so few symbols, CV folds can contain only one "
+                  "class. Cache more symbols for a robust cross-sectional model. "
+                  "(Degenerate folds are now skipped rather than crashing.)")
+
     valid_idx = panel.index[mask].to_numpy()
     folds = list(time_cv_by_timestamp(pl, n_splits=n_splits, embargo_days=embargo_days, target_mask=mask))
     X_full = sanitize_feature_matrix(
@@ -1422,6 +1475,7 @@ def train_5d_quantile_cls(panel: pd.DataFrame, feats: List[str], ev_target: str,
     )
     y_full = y.loc[mask].astype(int).values
     oos_prob = np.full(len(X_full), np.nan)
+    n_skipped = 0
     eta = ProgressETA(total=len(folds), label="Train 5D-Quantile-CLS")
     for fold_no, (tr_idx, te_idx) in enumerate(folds, start=1):
         tr_pos = np.where(np.isin(valid_idx, tr_idx))[0]
@@ -1437,11 +1491,17 @@ def train_5d_quantile_cls(panel: pd.DataFrame, feats: List[str], ev_target: str,
         y_val = y_full[val_pos] if len(val_pos)>0 else y_tr
         X_te = X_full.iloc[te_pos]
         clf = LGBMClassifier(**_lgbm_cls_params(GLOBAL_SEED + 300 + fold_no))
-        callbacks = _lgb_callbacks(len(X_val))
-        clf.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], eval_metric="binary_logloss", callbacks=callbacks)
+        if not _fit_binary_cls_safe(clf, X_tr, y_tr, X_val, y_val, eval_metric="binary_logloss"):
+            n_skipped += 1
+            eta.tick(f"fold {fold_no} SKIPPED (training fold has a single class)")
+            continue
         prob = clf.predict_proba(X_te)[:, 1]
         oos_prob[te_pos] = prob
         eta.tick(f"fold {fold_no}")
+    if n_skipped:
+        print(f"[5D-CLS] {n_skipped}/{len(folds)} fold(s) skipped due to single-class "
+              f"training data (thin cross-section). OOS probabilities for those test "
+              f"segments remain NaN and are ignored downstream.")
     return oos_prob, valid_idx, pl
 
 # ===================== Final Train → Calibrate → Test (EV mapper fixed) =====================
@@ -1596,8 +1656,9 @@ def train_1d_followthrough(panel: pd.DataFrame, feats: List[str], margin_pct: fl
             reg_alpha=0.4, reg_lambda=8.0, class_weight=None,
             n_jobs=-1, random_state=int(GLOBAL_SEED + 500 + fold_no), verbosity=-1,
         ))
-        callbacks = _lgb_callbacks(len(X_val))
-        clf.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], eval_metric="binary_logloss", callbacks=callbacks)
+        if not _fit_binary_cls_safe(clf, X_tr, y_tr, X_val, y_val, eval_metric="binary_logloss"):
+            eta.tick(f"fold {fold_no} SKIPPED (single-class train)")
+            continue
         eta.tick(f"fold {fold_no}")
 
     # FINAL refit on full labeled history with time-ordered Train/Cal split
