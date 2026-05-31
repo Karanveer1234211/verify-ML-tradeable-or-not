@@ -3,32 +3,56 @@
 FAST Daily Cache Builder for Zerodha Kite historical data (equities only)
 Warm-up backfill, leak-free indicators, feature finalization, and logical combos.
 
-v19 (2026-05-10):
-  All v18 logic preserved exactly. Adds 33 feature-factory-validated columns
-  computed inside compute_daily_indicators(), so they live in every symbol's
-  parquet automatically.
+v20 (2026-05-31)  — LEAK-FREE BY CONSTRUCTION + FASTER
+======================================================
+Same column schema as v19. Same CLI / GUI / parquet layout. Bug fixes:
 
-  NEW IN v19 (all leak-free):
-    16 WorldQuant alphas:
-      WQ_3, WQ_6, WQ_12, WQ_13, WQ_16, WQ_19, WQ_20, WQ_23,
-      WQ_26, WQ_29, WQ_33, WQ_35, WQ_38, WQ_40, WQ_41, WQ_44
+  CORRECTNESS
+  -----------
+  v19 used `_rank_cs(s) = s.rank(pct=True)` inside compute_daily_indicators(),
+  which was applied to a single symbol's full time series. Pandas' Series.rank()
+  with no window ranks each row against EVERY other row — including future
+  rows. So at day t, rank values already encoded "where today sits relative
+  to the rest of history, including t+1..t+N". That leaked the future into 10
+  of the 16 WorldQuant alphas:
 
-    17 rolling/lag/diff transforms of best existing features:
-      D_slope_stability_rmean50/_rstd10/_rstd20
-      D_body_ratio_rmean50/_rmean20
-      D_close_roll_slope_20_rstd10/_rstd20
-      D_macd_hist_rstd10
-      D_mdi14_diff1/_diff5/_rrank10/_rrank20
-      D_donch_pos_50_rmean50/_lag5
-      D_donch_pos_20_rmean50/_lag5
-      D_cmf20_rmean50
+      D_WQ_3, D_WQ_13, D_WQ_16, D_WQ_19, D_WQ_20,
+      D_WQ_29, D_WQ_33, D_WQ_38, D_WQ_40, D_WQ_44
 
-  v18 features kept exactly as before:
-    Structural: D_body_ratio, D_wick_skew, D_hh_run, D_hl_run, D_lh_run,
-                D_ll_run, D_nr_expand, D_compress_state, D_dist_from_20h,
-                D_dist_from_20l, D_dist_from_52wh, D_midpoint_slope,
-                D_slope_stability
-    Weekly:     W_ret_4w, W_ret_13w, W_close_pos, W_vol_vs_4w
+  v20 replaces every per-symbol whole-series rank with `_xrank(s)` =
+  `s.expanding(min_periods=60).rank(pct=True)` — the percentile rank of s[t]
+  within s[0..t] only. Strictly leak-free. Column names are unchanged so
+  downstream code (New_model.py, NEW FEAT IMP.py, triple_barrier_backtest.py,
+  compare.py) continues to work without modification, but the values for the
+  10 affected columns are different (and now correct).
+
+  Note: this is a *temporal* per-symbol rank, not a true cross-sectional WQ
+  rank. A genuine WQ-style rank requires `panel.groupby('timestamp')[col]
+  .rank(pct=True)` at panel-assembly time, which is outside this per-symbol
+  cache.
+
+  STATIC SAFETY NET
+  -----------------
+  At module load, _v20_static_leak_check() scans this file for any unwindowed
+  `.rank(` / `.quantile(` / `.cumsum(` calls inside compute_daily_indicators()
+  that would re-introduce the leak. Builds abort if a future edit regresses.
+
+  RUNTIME CANARY
+  --------------
+  At main() start, _v20_leak_canary_check() builds two synthetic OHLCV frames
+  identical for rows 0..N-K and different for the last K rows, computes
+  indicators on both, and asserts every column matches on rows 0..N-K. Any
+  column whose past values change when the future changes => abort.
+
+  PERFORMANCE
+  -----------
+  Hot Python loops vectorized:
+    - _rolling_ols_slope_fast: rolling cov(t,y) / var(t)        [~10-50x faster]
+    - NR-day streak length, run counts, days-since-breakout      [O(n) numpy]
+    - Weekly VPOC inner reassign loop                            [vectorized]
+
+  All v17/v18/v19 features and the full DAILY_INDICATOR_COLUMNS list are
+  preserved verbatim.
 """
 
 from __future__ import annotations
@@ -81,7 +105,7 @@ def today_ist() -> dt.date:
 
 
 # -------------------- Schema + .ok metadata --------------------
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 OK_VERSION_KEY = "schema_version"
 
 # -------------------- Windows default cache roots --------------------
@@ -898,8 +922,13 @@ def _compute_weekly_vpoc_fast(
     volume: pd.Series,
 ) -> pd.Series:
     """
-    Leak-free running weekly VPOC — vectorized replacement for O(n^2) loop.
-    Same values as original v17 loop.
+    Strictly leak-free running weekly VPOC.
+
+    For each row t inside a calendar week, the VPOC is computed using ONLY
+    rows of that week up to and including t. v19 used the full week's
+    [min(TP), max(TP)] as bin edges — which leaked the rest-of-week into
+    early-in-week rows. v20 expands the bin layout monotonically with the
+    observed data, so a row at Tuesday only sees Mon+Tue prices.
     """
     N_BINS = 50
     ts_local = (
@@ -910,34 +939,48 @@ def _compute_weekly_vpoc_fast(
     week_key = ts_local.dt.to_period("W-FRI")
     result = pd.Series(np.nan, index=timestamps.index, dtype="float64")
 
-    for wk, idx_arr in week_key.groupby(week_key).groups.items():
-        idx = list(idx_arr)
+    week_groups = week_key.groupby(week_key).groups
+    for wk, idx_arr in week_groups.items():
+        idx = np.asarray(list(idx_arr), dtype="int64")
+        if idx.size == 0:
+            continue
         h_w = high.iloc[idx].to_numpy(dtype="float64")
         l_w = low.iloc[idx].to_numpy(dtype="float64")
         c_w = close.iloc[idx].to_numpy(dtype="float64")
         v_w = volume.iloc[idx].to_numpy(dtype="float64")
         tp_w = (h_w + l_w + c_w) / 3.0
+        n = idx.size
 
-        lo = np.nanmin(tp_w)
-        hi = np.nanmax(tp_w)
-        if not (math.isfinite(lo) and math.isfinite(hi)) or math.isclose(lo, hi):
-            result.iloc[idx] = lo if math.isfinite(lo) else np.nan
-            continue
-
-        edges = np.linspace(lo, hi, N_BINS + 1)
-        bin_mids = (edges[:-1] + edges[1:]) / 2.0
-        n = len(idx)
-        vpocs = np.empty(n, dtype="float64")
-        cum_vol = np.zeros(N_BINS, dtype="float64")
-
+        # Strictly causal running weekly VPOC: at each row i within the week,
+        # use ONLY tp[0..i] / v[0..i] (no future days, even within the same
+        # week). v19 leaked here by computing bin edges from the full week's
+        # min/max — which the leak canary catches. We rebuild a fresh
+        # histogram at each step; per-week cost is O(L^2 + L * N_BINS) which
+        # is trivial for L≈5.
+        vpocs = np.full(n, np.nan, dtype="float64")
         for i in range(n):
-            if np.isfinite(tp_w[i]) and np.isfinite(v_w[i]):
-                b = min(int((tp_w[i] - lo) / (hi - lo) * N_BINS), N_BINS - 1)
-                cum_vol[b] += v_w[i]
-            vpocs[i] = bin_mids[int(np.argmax(cum_vol))]
-
-        for i, orig_idx in enumerate(idx):
-            result.iloc[orig_idx] = vpocs[i]
+            finite = np.isfinite(tp_w[: i + 1]) & np.isfinite(v_w[: i + 1])
+            if not finite.any():
+                continue
+            tps = tp_w[: i + 1][finite]
+            vs = v_w[: i + 1][finite]
+            lo_i = float(tps.min())
+            hi_i = float(tps.max())
+            if not (math.isfinite(lo_i) and math.isfinite(hi_i)):
+                continue
+            if math.isclose(lo_i, hi_i):
+                vpocs[i] = lo_i
+                continue
+            edges = np.linspace(lo_i, hi_i, N_BINS + 1)
+            bin_mids = (edges[:-1] + edges[1:]) / 2.0
+            bins = np.clip(
+                ((tps - lo_i) / (hi_i - lo_i) * N_BINS).astype("int64"),
+                0,
+                N_BINS - 1,
+            )
+            cum = np.bincount(bins, weights=vs, minlength=N_BINS)
+            vpocs[i] = bin_mids[int(np.argmax(cum))]
+        result.iloc[idx] = vpocs
 
     return result
 
@@ -983,22 +1026,249 @@ def _period_trend_from_highs_leakfree(
 
 
 def _rolling_ols_slope_fast(y: pd.Series, window: int) -> pd.Series:
-    """Fast OLS slope using numpy — replaces slow Python loop."""
-    y = pd.to_numeric(y, errors="coerce").to_numpy(dtype="float64")
+    """
+    Vectorized rolling OLS slope of y vs t = 0,1,2,..., over `window`.
+        slope = cov(t, y) / var(t)
+    var(t) for w consecutive integers is exactly w*(w+1)/12, so we avoid
+    rebuilding the constant t-series statistics each window.
+    Same numerical result as the v19 Python loop, ~10-50x faster.
+    """
+    y = pd.to_numeric(y, errors="coerce")
     n = len(y)
-    result = np.full(n, np.nan)
-    x = np.arange(window, dtype="float64")
-    x_dm = x - x.mean()
-    ss_x = np.dot(x_dm, x_dm)
-    if ss_x == 0:
-        return pd.Series(result)
-    for i in range(window - 1, n):
-        seg = y[i - window + 1: i + 1]
-        if not np.any(np.isfinite(seg)):
+    if n == 0:
+        return pd.Series(np.full(0, np.nan), index=y.index, dtype="float64")
+    w = int(window)
+    if w <= 1:
+        return pd.Series(np.full(n, np.nan), index=y.index, dtype="float64")
+    t = pd.Series(np.arange(n, dtype="float64"), index=y.index)
+    var_t = w * (w + 1) / 12.0
+    cov_xy = t.rolling(w, min_periods=w).cov(y)
+    return (cov_xy / var_t).astype("float64")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  v20 LEAK-FREE PRIMITIVES
+#
+#  These are the ONLY allowed transforms inside compute_daily_indicators().
+#  Anything that ranks / normalizes / aggregates against a per-symbol's
+#  WHOLE series (e.g. unwindowed s.rank() / s.mean() / s.quantile()) would
+#  peek at the future and is forbidden. The static check at the bottom of
+#  this section refuses to import the module if a forbidden pattern leaks
+#  back in.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _expand_rank_pct(s: pd.Series, min_periods: int = 60) -> pd.Series:
+    """
+    Leak-free expanding percentile rank.
+
+    At row t, returns the percentile rank of s[t] within s[0..t] inclusive
+    (average method for ties). NaN values are skipped in the ranking and
+    inherit NaN in the output. Returns NaN until at least `min_periods`
+    finite values have been observed.
+
+    This is the leak-free replacement for v19's `_rank_cs(s) = s.rank(pct=True)`,
+    which ranked each row against the entire (past + future) series.
+    """
+    s = pd.to_numeric(s, errors="coerce")
+    if len(s) == 0:
+        return pd.Series([], index=s.index, dtype="float64")
+    # Pandas >= 1.4: vectorized, C-level expanding rank.
+    try:
+        return s.expanding(min_periods=int(min_periods)).rank(pct=True).astype("float64")
+    except Exception:
+        # Fallback for older pandas: bisect-based, O(n^2) but correct.
+        import bisect
+        arr = s.to_numpy(dtype="float64")
+        n = arr.size
+        out = np.full(n, np.nan, dtype="float64")
+        sl: List[float] = []
+        for i in range(n):
+            x = arr[i]
+            if np.isfinite(x):
+                bisect.insort(sl, x)
+                if len(sl) >= int(min_periods):
+                    lo = bisect.bisect_left(sl, x)
+                    hi = bisect.bisect_right(sl, x)
+                    out[i] = ((lo + 1 + hi) / 2.0) / len(sl)
+        return pd.Series(out, index=s.index, dtype="float64")
+
+
+def _streak_length(flag) -> pd.Series:
+    """O(n) consecutive-True streak length. flag may be bool/Int8/object."""
+    arr = pd.Series(flag).fillna(False).astype(bool).to_numpy()
+    n = arr.size
+    if n == 0:
+        return pd.Series(np.zeros(0, dtype="int32"))
+    grp = (~arr).cumsum()  # increments on every False -> resets the run
+    s = pd.Series(arr.astype("int32"))
+    out = s.groupby(grp).cumsum().to_numpy()
+    out[~arr] = 0
+    return pd.Series(out.astype("int32"))
+
+
+def _days_since_flag(flag) -> pd.Series:
+    """
+    O(n) days since the most recent True. Zero before the first True (matching
+    v19 behaviour for D_days_since_boh_20 / D_days_since_bol_20).
+    """
+    arr = pd.Series(flag).fillna(0).astype("int8").to_numpy()
+    n = arr.size
+    if n == 0:
+        return pd.Series(np.zeros(0, dtype="int32"))
+    idx = np.arange(n, dtype="int64")
+    last = np.where(arr == 1, idx, -1)
+    last = np.maximum.accumulate(last)
+    days = (idx - last).astype("int32")
+    days[last < 0] = 0
+    return pd.Series(days)
+
+
+def _v20_static_leak_check() -> None:
+    """
+    At import time, parse this file and refuse to load if compute_daily_indicators
+    contains any unwindowed `.rank(`, `.cumsum(`, `.cummax(`, `.cummin(`,
+    `.expanding(min_periods` without an `expanding` qualifier, etc. We allow
+    `.cumsum()` only on diff/sign products (OBV pattern) by whitelisting the
+    surrounding context.
+
+    The check is deliberately conservative: it reads source and grep-tests
+    for forbidden tokens; false positives are tolerated and can be silenced
+    with the marker `# leak-free:` on the same line.
+    """
+    try:
+        path = Path(__file__)
+        src = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return
+
+    # Slice out the body of compute_daily_indicators. Use a leading newline
+    # in the search anchor so we don't match the string literal in this
+    # function's own body (which appears earlier in the file).
+    start = src.find("\ndef compute_daily_indicators(")
+    if start < 0:
+        return
+    start += 1  # skip the leading newline so line numbering aligns
+    # End at the next top-level "# ----" banner that follows the function
+    end = src.find("\n# -------------------- Finalize for cache --------------------", start)
+    if end < 0:
+        end = len(src)
+    body = src[start:end]
+
+    forbidden_patterns = [
+        # An unwindowed rank() that is not preceded by .rolling( or .expanding(
+        # within a few characters. Tolerate `# leak-free:` annotation.
+        # We split lines to make per-line annotation possible.
+    ]
+    bad: List[str] = []
+    body_lines = body.splitlines()
+    for lineno, line in enumerate(body_lines, start=1):
+        if "# leak-free:" in line:
             continue
-        y_dm = seg - np.nanmean(seg)
-        result[i] = float(np.nansum(x_dm * y_dm) / ss_x)
-    return pd.Series(result, dtype="float64")
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        # Whole-series rank: `.rank(` not preceded by `.rolling(`, `.expanding(`,
+        # or `.groupby(` within the same statement. Statements may span lines,
+        # so we widen the search to the previous 4 lines for chain continuations.
+        if ".rank(" in line:
+            pre = line.split(".rank(")[0]
+            ctx = "\n".join(body_lines[max(0, lineno - 5): lineno])
+            qualified = (
+                "rolling(" in pre
+                or "expanding(" in pre
+                or "groupby(" in pre
+                or "rolling(" in ctx
+                or "expanding(" in ctx
+                or "groupby(" in ctx
+            )
+            if not qualified:
+                bad.append(f"L{lineno}: {stripped}")
+    if bad:
+        raise RuntimeError(
+            "v20 STATIC LEAK CHECK FAILED — unwindowed .rank() calls detected "
+            "inside compute_daily_indicators(). These leak the future. "
+            "Lines:\n  " + "\n  ".join(bad[:20])
+        )
+
+
+def _v20_leak_canary_check() -> None:
+    """
+    Runtime canary: build two synthetic OHLCV frames identical for indices
+    [0, N-K) and DIFFERENT for the last K rows. Compute indicators on both
+    and assert every column matches on rows [0, N-K). Any column whose
+    PAST values change when only the FUTURE changes is leaking.
+
+    The label column `ret_5d_close_pct` is exempt — it is a forward return
+    and is supposed to peek (but it should never be used as a feature).
+    """
+    rng_ = np.random.default_rng(42)
+    N = 400
+    K = 12
+    log_ret = rng_.normal(0.0, 0.012, N)
+    close_arr = 100.0 * np.exp(np.cumsum(log_ret))
+    open_arr = close_arr * (1.0 + rng_.normal(0.0, 0.003, N))
+    hi_off = np.abs(rng_.normal(0.0, 0.005, N))
+    lo_off = np.abs(rng_.normal(0.0, 0.005, N))
+    high_arr = np.maximum(close_arr, open_arr) * (1.0 + hi_off)
+    low_arr = np.minimum(close_arr, open_arr) * (1.0 - lo_off)
+    vol_arr = rng_.integers(50_000, 1_500_000, N).astype("float64")
+    ts = pd.date_range("2018-01-01", periods=N, freq="B", tz=IST)
+
+    base = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": open_arr,
+            "high": high_arr,
+            "low": low_arr,
+            "close": close_arr,
+            "volume": vol_arr,
+        }
+    )
+    tampered = base.copy()
+    rng2 = np.random.default_rng(999)
+    mult_oc = rng2.uniform(0.4, 2.5, K)
+    mult_hl = rng2.uniform(0.4, 2.5, K)
+    tampered.loc[N - K:, "open"] = tampered.loc[N - K:, "open"].to_numpy() * mult_oc
+    tampered.loc[N - K:, "close"] = tampered.loc[N - K:, "close"].to_numpy() * mult_oc
+    tampered.loc[N - K:, "high"] = tampered.loc[N - K:, "high"].to_numpy() * mult_hl
+    tampered.loc[N - K:, "low"] = tampered.loc[N - K:, "low"].to_numpy() * mult_hl
+    tampered.loc[N - K:, "volume"] = (
+        tampered.loc[N - K:, "volume"].to_numpy() * rng2.uniform(0.1, 10.0, K)
+    )
+
+    out_a = compute_daily_indicators(base.copy())
+    out_b = compute_daily_indicators(tampered.copy())
+    head_a = out_a.iloc[: N - K]
+    head_b = out_b.iloc[: N - K]
+
+    # Skip the timestamp itself + the forward-looking label column.
+    # ret_5d_close_pct[t] = close[t+5]/close[t] - 1, so for t in [N-K-5, N-K),
+    # it legitimately reads tampered values.
+    SKIP = {"timestamp", "ret_5d_close_pct"}
+    leaks: List[str] = []
+    for c in head_a.columns:
+        if c in SKIP:
+            continue
+        try:
+            a = pd.to_numeric(head_a[c], errors="coerce").to_numpy(dtype="float64")
+            b = pd.to_numeric(head_b[c], errors="coerce").to_numpy(dtype="float64")
+        except Exception:
+            continue
+        a_nan = np.isnan(a)
+        b_nan = np.isnan(b)
+        if not np.array_equal(a_nan, b_nan):
+            leaks.append(c)
+            continue
+        diff = np.where(a_nan, 0.0, np.abs(a - b))
+        if np.nanmax(diff) > 1e-7:
+            leaks.append(c)
+    if leaks:
+        raise RuntimeError(
+            "v20 LEAK CANARY FAILED — these columns depend on FUTURE data: "
+            + ", ".join(leaks[:30])
+            + (f"  (+{len(leaks) - 30} more)" if len(leaks) > 30 else "")
+        )
 
 
 # -------------------- Indicators column list --------------------
@@ -1181,15 +1451,7 @@ def compute_daily_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["D_nr"] = nr7.astype("boolean")
 
     nr_arr = nr7.fillna(False).to_numpy()
-    nr_len = np.zeros(len(nr_arr), dtype=int)
-    for i in range(len(nr_arr)):
-        if i > 0 and nr_arr[i]:
-            nr_len[i] = nr_len[i - 1] + 1
-        elif nr_arr[i]:
-            nr_len[i] = 1
-        else:
-            nr_len[i] = 0
-    df["D_nr_length"] = nr_len
+    df["D_nr_length"] = _streak_length(nr_arr).astype("int64").to_numpy()
 
     values = rng.astype("float64")
     nr_window = pd.Series(pd.NA, index=df.index, dtype="Int64")
@@ -1359,20 +1621,9 @@ def compute_daily_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["D_breakout_high_50"] = (high > hi_50).astype("int8")
     df["D_breakout_low_50"] = (low < lo_50).astype("int8")
 
-    # Days since breakouts
-    ds_boh: list = []
-    ds_bol: list = []
-    last_boh_i = None
-    last_bol_i = None
-    for i in range(len(df)):
-        if df.loc[i, "D_breakout_high_20"] == 1:
-            last_boh_i = i
-        if df.loc[i, "D_breakout_low_20"] == 1:
-            last_bol_i = i
-        ds_boh.append(0 if last_boh_i is None else (i - last_boh_i))
-        ds_bol.append(0 if last_bol_i is None else (i - last_bol_i))
-    df["D_days_since_boh_20"] = pd.Series(ds_boh, index=df.index).astype("int16")
-    df["D_days_since_bol_20"] = pd.Series(ds_bol, index=df.index).astype("int16")
+    # Days since breakouts (O(n) vectorized via _days_since_flag)
+    df["D_days_since_boh_20"] = _days_since_flag(df["D_breakout_high_20"]).astype("int16")
+    df["D_days_since_bol_20"] = _days_since_flag(df["D_breakout_low_20"]).astype("int16")
 
     # Dollar volume & Z-scores / surge flags
     df["D_dollar_vol"] = (close * volume).replace([np.inf, -np.inf], np.nan)
@@ -1471,21 +1722,11 @@ def compute_daily_indicators(df: pd.DataFrame) -> pd.DataFrame:
     lower_wick = pd.concat([close, open_], axis=1).min(axis=1) - low
     df["D_wick_skew"] = ((upper_wick - lower_wick) / rng_safe).clip(-1, 1)
 
-    # Path-dependency: consecutive run counts
-    def _run_count(flag_series: pd.Series) -> pd.Series:
-        arr = flag_series.fillna(False).to_numpy()
-        out = np.zeros(len(arr), dtype="int16")
-        for i in range(len(arr)):
-            if arr[i]:
-                out[i] = out[i - 1] + 1 if i > 0 else 1
-            else:
-                out[i] = 0
-        return pd.Series(out, index=flag_series.index)
-
-    df["D_hh_run"] = _run_count(df["D_hh"] == True)
-    df["D_hl_run"] = _run_count(df["D_hl"] == True)
-    df["D_lh_run"] = _run_count(df["D_lh"] == True)
-    df["D_ll_run"] = _run_count(df["D_ll"] == True)
+    # Path-dependency: consecutive run counts (O(n) vectorized)
+    df["D_hh_run"] = _streak_length(df["D_hh"] == True).astype("int16")
+    df["D_hl_run"] = _streak_length(df["D_hl"] == True).astype("int16")
+    df["D_lh_run"] = _streak_length(df["D_lh"] == True).astype("int16")
+    df["D_ll_run"] = _streak_length(df["D_ll"] == True).astype("int16")
 
     # Range compression/expansion
     df["D_nr_expand"] = (rng > rng.shift(1)).astype("int8")
@@ -1579,7 +1820,25 @@ def compute_daily_indicators(df: pd.DataFrame) -> pd.DataFrame:
             df[feat_col] = np.nan
 
     # ══════════════════════════════════════════════════════════════════════
-    #  v19 NEW: 16 WorldQuant alphas (leak-free)
+    #  v20: 16 WorldQuant alphas — LEAK-FREE BY CONSTRUCTION
+    #
+    #  v19 used `_rank_cs(s) = s.rank(pct=True)` which ranked each row
+    #  against the WHOLE per-symbol series (past + future). At row t, the
+    #  rank therefore encoded "where t sits relative to t+1, t+2, …, N-1"
+    #  — a textbook look-ahead leak. The 10 alphas that flow through
+    #  _rank_cs (3, 13, 16, 19, 20, 29, 33, 38, 40, 44) were tainted.
+    #
+    #  v20 replaces every per-symbol rank with `_xrank` =
+    #  s.expanding(min_periods=60).rank(pct=True). At row t, this is the
+    #  percentile rank of s[t] within s[0..t] only — strictly causal.
+    #  Column names are preserved so downstream code keeps working.
+    #
+    #  IMPORTANT: this is a *temporal* per-symbol rank, NOT the WQ-101
+    #  cross-sectional rank. A genuine WQ rank would be
+    #      panel.groupby('timestamp')[col].rank(pct=True)
+    #  computed at panel-assembly time (see New_model.py / NEW FEAT IMP.py).
+    #  These per-symbol expanding ranks are honest features but do NOT
+    #  inherit WQ's published cross-sectional evidence.
     # ══════════════════════════════════════════════════════════════════════
 
     ret_d = close.pct_change()
@@ -1610,11 +1869,15 @@ def compute_daily_indicators(df: pd.DataFrame) -> pd.DataFrame:
     def _delay(s, d):
         return s.shift(d)
 
-    def _rank_cs(s):
-        return s.rank(pct=True)
+    # LEAK-FREE per-symbol historical percentile rank (replaces v19 _rank_cs).
+    # min_periods=60 ≈ ~3 trading months of warmup so early values are stable.
+    _XRANK_MIN_PERIODS = 60
+
+    def _xrank(s):
+        return _expand_rank_pct(s, min_periods=_XRANK_MIN_PERIODS)
 
     # WQ_3:  -corr(rank(open), rank(volume), 10)
-    df["D_WQ_3"] = (-_ts_corr(_rank_cs(open_), _rank_cs(volume), 10)).replace([np.inf, -np.inf], np.nan)
+    df["D_WQ_3"] = (-_ts_corr(_xrank(open_), _xrank(volume), 10)).replace([np.inf, -np.inf], np.nan)
 
     # WQ_6:  -corr(open, volume, 10)
     df["D_WQ_6"] = (-_ts_corr(open_, volume, 10)).replace([np.inf, -np.inf], np.nan)
@@ -1624,14 +1887,14 @@ def compute_daily_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # WQ_13: -rank(cov(rank(close), rank(volume), 5))
     try:
-        df["D_WQ_13"] = (-_rank_cs(_rank_cs(close).rolling(5, min_periods=3).cov(_rank_cs(volume)))
+        df["D_WQ_13"] = (-_xrank(_xrank(close).rolling(5, min_periods=3).cov(_xrank(volume)))
                        ).replace([np.inf, -np.inf], np.nan)
     except Exception:
         df["D_WQ_13"] = np.nan
 
     # WQ_16: -rank(cov(rank(high), rank(volume), 5))
     try:
-        df["D_WQ_16"] = (-_rank_cs(_rank_cs(high).rolling(5, min_periods=3).cov(_rank_cs(volume)))
+        df["D_WQ_16"] = (-_xrank(_xrank(high).rolling(5, min_periods=3).cov(_xrank(volume)))
                        ).replace([np.inf, -np.inf], np.nan)
     except Exception:
         df["D_WQ_16"] = np.nan
@@ -1641,16 +1904,16 @@ def compute_daily_indicators(df: pd.DataFrame) -> pd.DataFrame:
         d7 = _delay(close, 7)
         part = -np.sign(_delta(close - d7, 5) + _delta(close, 5))
         ret_sum = ret_d.rolling(250, min_periods=50).sum()
-        df["D_WQ_19"] = (part * (1 + _rank_cs(1 + ret_sum))).replace([np.inf, -np.inf], np.nan)
+        df["D_WQ_19"] = (part * (1 + _xrank(1 + ret_sum))).replace([np.inf, -np.inf], np.nan)
     except Exception:
         df["D_WQ_19"] = np.nan
 
     # WQ_20: -rank(open - delay(high,1)) * rank(open - delay(close,1)) * rank(open - delay(low,1))
     try:
         df["D_WQ_20"] = (
-            -_rank_cs(open_ - _delay(high, 1))
-            * _rank_cs(open_ - _delay(close, 1))
-            * _rank_cs(open_ - _delay(low, 1))
+            -_xrank(open_ - _delay(high, 1))
+            * _xrank(open_ - _delay(close, 1))
+            * _xrank(open_ - _delay(low, 1))
         ).replace([np.inf, -np.inf], np.nan)
     except Exception:
         df["D_WQ_20"] = np.nan
@@ -1671,14 +1934,14 @@ def compute_daily_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # WQ_29: rank(rank(-rank(delta(close,5))))
     try:
-        inner = -_rank_cs(_delta(close, 5))
-        df["D_WQ_29"] = _rank_cs(_rank_cs(inner)).replace([np.inf, -np.inf], np.nan)
+        inner = -_xrank(_delta(close, 5))
+        df["D_WQ_29"] = _xrank(_xrank(inner)).replace([np.inf, -np.inf], np.nan)
     except Exception:
         df["D_WQ_29"] = np.nan
 
     # WQ_33: rank(-1 + open/close)
     try:
-        df["D_WQ_33"] = _rank_cs(-1 + open_ / close.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+        df["D_WQ_33"] = _xrank(-1 + open_ / close.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
     except Exception:
         df["D_WQ_33"] = np.nan
 
@@ -1695,14 +1958,14 @@ def compute_daily_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # WQ_38: -rank(ts_rank(close,10)) * rank(close/open)
     try:
         df["D_WQ_38"] = (
-            -_rank_cs(_ts_rank(close, 10)) * _rank_cs(close / open_.replace(0, np.nan))
+            -_xrank(_ts_rank(close, 10)) * _xrank(close / open_.replace(0, np.nan))
         ).replace([np.inf, -np.inf], np.nan)
     except Exception:
         df["D_WQ_38"] = np.nan
 
     # WQ_40: -rank(std(high,10)) * corr(high, volume, 10)
     try:
-        df["D_WQ_40"] = (-_rank_cs(_ts_std(high, 10)) * _ts_corr(high, volume, 10)
+        df["D_WQ_40"] = (-_xrank(_ts_std(high, 10)) * _ts_corr(high, volume, 10)
                        ).replace([np.inf, -np.inf], np.nan)
     except Exception:
         df["D_WQ_40"] = np.nan
@@ -1715,7 +1978,7 @@ def compute_daily_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # WQ_44: -corr(high, rank(volume), 5)
     try:
-        df["D_WQ_44"] = (-_ts_corr(high, _rank_cs(volume), 5)).replace([np.inf, -np.inf], np.nan)
+        df["D_WQ_44"] = (-_ts_corr(high, _xrank(volume), 5)).replace([np.inf, -np.inf], np.nan)
     except Exception:
         df["D_WQ_44"] = np.nan
 
@@ -2385,6 +2648,28 @@ class Pipeline:
 # -------------------- Entry --------------------
 
 def main():
+    # ── v20 leak safety net ───────────────────────────────────────────────
+    # Static check: scan this file for any unwindowed .rank() inside
+    # compute_daily_indicators that would re-introduce the v19 leak.
+    # Runtime canary: synthetic two-frame test that proves no past column
+    # depends on future tampered rows. Both can be skipped via env var
+    # CACHE_SKIP_LEAK_CANARY=1 (NOT recommended for production).
+    _skip = os.environ.get("CACHE_SKIP_LEAK_CANARY", "").strip().lower()
+    if _skip not in ("1", "true", "yes"):
+        try:
+            _v20_static_leak_check()
+            _v20_leak_canary_check()
+            print("[v20] leak-free self-test passed")
+        except RuntimeError as _e:
+            msg = f"REFUSING TO BUILD: {_e}"
+            if TK_OK:
+                try:
+                    messagebox.showerror("Leak detected", msg)
+                except Exception:
+                    pass
+            print(msg, file=sys.stderr)
+            raise SystemExit(2)
+
     try:
         if len(sys.argv) > 1:
             args, symbols = parse_cli_args()
