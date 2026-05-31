@@ -1,0 +1,13 @@
+# Python caches / envs
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# strategy_lab.py generated outputs (research artifacts, not source)
+strategy_lab_scoreboard.csv
+strategy_lab_summary.json
+strategy_lab_top.csv
+
+# edge_finder.py generated output
+edge_finder_results.csv
