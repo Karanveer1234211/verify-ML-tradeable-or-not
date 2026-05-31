@@ -97,6 +97,11 @@ PRIMARY_SL_PCT = 0.03
 
 ALLOWED_REGIMES = None       # None = all regimes; or e.g. ["bull_trend","bear_trend"]
 
+# Portfolio layer (daily top-K, max concurrent, equal sleeve, daily mark-to-market)
+PORT_MAX_CONCURRENT = 5      # max positions held at once
+PORT_TOP_K = 5               # max NEW entries considered per day (highest prob first)
+TRADING_DAYS_YEAR = 252
+
 
 # =============================================================================
 # CORE ENGINE  (pure-numpy, vectorized, unit-testable, no I/O)
@@ -161,7 +166,10 @@ def run_barrier(hr: np.ndarray, lr: np.ndarray, cr: np.ndarray,
 
 
 def bucket_label(p: float) -> str:
-    lo = np.floor(p / PROB_BUCKET_WIDTH) * PROB_BUCKET_WIDTH
+    # round before floor so exact multiples (0.30/0.05 == 5.999999.. in FP) bucket
+    # correctly instead of dropping a level.
+    b = int(np.floor(round(p / PROB_BUCKET_WIDTH, 9)))
+    lo = round(b * PROB_BUCKET_WIDTH, 2)
     return f"[{lo:.2f}, {lo + PROB_BUCKET_WIDTH:.2f})"
 
 
@@ -195,6 +203,85 @@ def _summary(net: np.ndarray, gross: np.ndarray, reason: np.ndarray,
         "avg_time_to_sl": round(float(np.nanmean(tsl)), 2) if sl.any() else np.nan,
         "sharpe_per_trade": round(net.mean() / (std + 1e-12), 3),
     }
+
+
+def simulate_portfolio(sel_mask, entry_g, exit_g, exit_bar, prob, gross, net, cr, fwd_g,
+                       K=PORT_MAX_CONCURRENT, top_k=PORT_TOP_K):
+    """
+    Daily top-K, max-K-concurrent, equal-sleeve portfolio with daily
+    mark-to-market. Greedy: each day fill free slots with the highest-prob new
+    signals (a slot freed by an exit is reusable the NEXT day -> no same-day
+    reuse, conservative). Capital is split into K sleeves that compound
+    independently; idle sleeves sit in cash (so exposure < 100% shows as cash drag).
+
+    sel_mask : bool over trades to include (scope / bucket / regime filter)
+    *_g      : global trading-day index of entry bar / exit bar
+    exit_bar : 0-based index of the exit bar within the trade's path
+    Returns (equity_series, stats_dict).
+    """
+    idx = np.where(sel_mask)[0]
+    if len(idx) == 0:
+        return None, {"n_trades": 0}
+    order = idx[np.lexsort((-prob[idx], entry_g[idx]))]   # entry day asc, prob desc
+    by_day = {}
+    for t in order:
+        by_day.setdefault(int(entry_g[t]), []).append(int(t))
+
+    d0 = int(entry_g[idx].min()); d1 = int(exit_g[idx].max())
+    slot_value = np.full(K, 1.0 / K)        # sleeve cash/committed capital
+    slot_trade = [None] * K
+    cache = {}                               # t -> (bar_days, bar_mults)
+
+    def _mult(t, d):
+        if t not in cache:
+            e = int(exit_bar[t])
+            bdays = fwd_g[t, :e + 1].astype(np.int64)
+            bmult = cr[t, :e + 1].astype(np.float64).copy()
+            bmult[-1] = 1.0 + gross[t]       # realize at barrier on the exit bar
+            cache[t] = (bdays, bmult)
+        bdays, bmult = cache[t]
+        j = int(np.searchsorted(bdays, d, side="right")) - 1
+        return bmult[j] if j >= 0 else 1.0   # carry forward across any gap days
+
+    equity, expo, taken = [], [], []
+    for d in range(d0, d1 + 1):
+        free = [i for i in range(K) if slot_trade[i] is None]
+        cands = by_day.get(d, [])
+        for j in range(min(len(free), top_k, len(cands))):
+            slot_trade[free[j]] = cands[j]
+            taken.append(cands[j])
+        eq = 0.0; held = 0
+        for i in range(K):
+            t = slot_trade[i]
+            if t is None:
+                eq += slot_value[i]
+            else:
+                eq += slot_value[i] * _mult(t, d); held += 1
+        equity.append(eq); expo.append(held / K)
+        for i in range(K):                   # exits at end of day
+            t = slot_trade[i]
+            if t is not None and int(exit_g[t]) == d:
+                slot_value[i] *= (1.0 + net[t]); slot_trade[i] = None
+
+    eq = np.asarray([1.0] + equity, dtype="float64")   # prepend initial capital (sum of sleeves)
+    dret = np.diff(eq) / eq[:-1] if len(eq) > 1 else np.array([0.0])
+    periods = max(len(eq) - 1, 1)                      # trading days elapsed
+    cagr = eq[-1] ** (TRADING_DAYS_YEAR / periods) - 1.0
+    sharpe = (dret.mean() / (dret.std() + 1e-12)) * np.sqrt(TRADING_DAYS_YEAR)
+    maxdd = float((eq / np.maximum.accumulate(eq) - 1.0).min())
+    tk = np.asarray(taken, dtype=int)
+    wr = float((net[tk] > 0).mean()) if len(tk) else np.nan
+    stats = {
+        "n_trades": int(len(tk)),
+        "final_equity": round(float(eq[-1]), 4),
+        "cagr_pct": round(100 * cagr, 2),
+        "sharpe_annual": round(float(sharpe), 2),
+        "max_drawdown_pct": round(100 * maxdd, 2),
+        "exposure_pct": round(100 * float(np.mean(expo)), 1),
+        "port_win_rate_pct": round(100 * wr, 2) if not np.isnan(wr) else np.nan,
+        "trading_days": periods,
+    }
+    return pd.Series(eq), stats
 
 
 # =============================================================================
@@ -251,12 +338,16 @@ def _build_forward_paths(panel: pd.DataFrame):
     entry = g["open"].shift(-1)                      # BUY at T+1 open
     H = MAX_HOLD
     hr = np.empty((len(panel), H)); lr = np.empty((len(panel), H)); cr = np.empty((len(panel), H))
+    fdates = np.full((len(panel), H), np.datetime64("NaT"), dtype="datetime64[ns]")
     valid_path = entry.notna().to_numpy()
     ent = entry.to_numpy()
     for k in range(1, H + 1):
         hk = g["high"].shift(-k).to_numpy()
         lk = g["low"].shift(-k).to_numpy()
         ck = g["close"].shift(-k).to_numpy()
+        # normalized (date-only, tz-naive) timestamp of bar k, for calendar alignment
+        dk = g["timestamp"].shift(-k).dt.tz_localize(None).dt.normalize().to_numpy()
+        fdates[:, k - 1] = dk
         valid_path &= np.isfinite(hk) & np.isfinite(lk) & np.isfinite(ck)
         with np.errstate(invalid="ignore", divide="ignore"):
             hr[:, k - 1] = hk / ent
@@ -285,7 +376,8 @@ def _build_forward_paths(panel: pd.DataFrame):
         "prob": panel["prob"].to_numpy()[sel],
         "atr_frac": atr_frac[sel],
     })
-    return meta.reset_index(drop=True), hr[sel].astype("float64"), lr[sel].astype("float64"), cr[sel].astype("float64")
+    return (meta.reset_index(drop=True), hr[sel].astype("float64"),
+            lr[sel].astype("float64"), cr[sel].astype("float64"), fdates[sel])
 
 
 def _oos_mask(ts: pd.Series) -> np.ndarray:
@@ -301,7 +393,7 @@ def _oos_mask(ts: pd.Series) -> np.ndarray:
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     panel = _load_scored_panel()
-    meta, hr, lr, cr = _build_forward_paths(panel)
+    meta, hr, lr, cr, fdates = _build_forward_paths(panel)
 
     meta["bucket"] = meta["prob"].apply(bucket_label)
     in_range = (meta["prob"] >= PROB_MIN) & (meta["prob"] < PROB_MAX)
@@ -312,6 +404,19 @@ def main():
 
     cost = COST_BPS / 10000.0
     af = meta["atr_frac"].to_numpy()
+
+    # ---- global trading-day calendar for the portfolio layer ----
+    all_days = np.sort(pd.to_datetime(panel["timestamp"]).dt.tz_localize(None)
+                       .dt.normalize().unique())
+    day_index = pd.DatetimeIndex(all_days)
+    n_sel = len(meta); H = MAX_HOLD
+    fwd_g = day_index.get_indexer(pd.DatetimeIndex(fdates.reshape(-1))).reshape(n_sel, H)
+    entry_g = fwd_g[:, 0]
+    oos_cut_idx = int(day_index.get_indexer(
+        [pd.Timestamp(cut).tz_localize(None).normalize()])[0])
+    prob_arr = meta["prob"].to_numpy()
+    in_range_np = in_range.to_numpy()
+    port_overall_rows, port_bucket_rows, primary_equity_oos = [], [], None
 
     print("\n[4/5] Running TP/SL grid (fixed % + ATR multiples) ...")
     combos = []
@@ -333,6 +438,16 @@ def main():
         net = res["gross"] - cost
         tag = (f"TP{tp:.0%}/SL{sl:.0%}" if mode == "pct"
                else f"TP{tp:g}xATR/SL{sl:g}xATR")
+        gross = res["gross"]; exit_bar0 = res["hold_bars"] - 1
+        exit_g = fwd_g[np.arange(n_sel), exit_bar0]
+
+        # ---- PORTFOLIO (daily top-K / max-K concurrent), overall Full + OOS ----
+        for pscope, smask in [("Full", in_range_np),
+                              ("OOS", in_range_np & (entry_g >= oos_cut_idx))]:
+            _, pst = simulate_portfolio(smask, entry_g, exit_g, exit_bar0, prob_arr,
+                                        gross, net, cr, fwd_g)
+            pst.update({"combo": tag, "mode": mode, "tp": tp, "sl": sl, "scope": pscope})
+            port_overall_rows.append(pst)
 
         for scope, m in [("Full", np.ones(len(meta), bool)), ("OOS", is_oos)]:
             mm = m & in_range.to_numpy()
@@ -376,6 +491,18 @@ def main():
             primary_detail["mfe_pct"] = (res["mfe"] * 100).round(3)
             primary_detail["gross_pct"] = (res["gross"] * 100).round(3)
             primary_detail["net_pct"] = (net * 100).round(3)
+            # ---- bucket-wise PORTFOLIO for the primary combo (the view you asked for) ----
+            for pscope, base in [("Full", np.ones(n_sel, bool)),
+                                 ("OOS", entry_g >= oos_cut_idx)]:
+                for bkt in sorted(meta["bucket"].unique()):
+                    smask = base & in_range_np & (meta["bucket"].to_numpy() == bkt)
+                    _, pst = simulate_portfolio(smask, entry_g, exit_g, exit_bar0, prob_arr,
+                                                gross, net, cr, fwd_g)
+                    pst.update({"combo": tag, "scope": pscope, "bucket": bkt})
+                    port_bucket_rows.append(pst)
+            primary_equity_oos, _ = simulate_portfolio(
+                in_range_np & (entry_g >= oos_cut_idx),
+                entry_g, exit_g, exit_bar0, prob_arr, gross, net, cr, fwd_g)
 
     grid_df = pd.DataFrame(grid_rows)
     bucket_df = pd.DataFrame(bucket_rows)
@@ -387,6 +514,13 @@ def main():
     regime_df.to_csv(OUT_DIR / "03_grid_x_regime.csv", index=False)
     if primary_detail is not None:
         primary_detail.to_csv(OUT_DIR / "04_trades_primary_TP5_SL3.csv", index=False)
+    port_overall_df = pd.DataFrame(port_overall_rows)
+    port_bucket_df = pd.DataFrame(port_bucket_rows)
+    port_overall_df.to_csv(OUT_DIR / "05_portfolio_overall.csv", index=False)
+    port_bucket_df.to_csv(OUT_DIR / "06_portfolio_x_probbucket.csv", index=False)
+    if primary_equity_oos is not None:
+        primary_equity_oos.to_frame("equity").to_csv(
+            OUT_DIR / "07_portfolio_equity_primary_oos.csv", index=False)
 
     # ---- console: OOS leaderboard by expectancy (fixed-% combos) ----
     oos = grid_df[grid_df["scope"] == "OOS"].copy().sort_values("expectancy_pct", ascending=False)
@@ -417,12 +551,40 @@ def main():
               f"{r['sl_rate_pct']:>8.1f}{r['expectancy_pct']:>+9.3f}{r['avg_mae_pct']:>+8.2f}"
               f"{r['avg_mfe_pct']:>+8.2f}")
 
+    # ---- console: PORTFOLIO leaderboard (top-5 / max-5), OOS ----
+    po = port_overall_df[port_overall_df["scope"] == "OOS"].copy()
+    po = po[po["n_trades"] > 0].sort_values("sharpe_annual", ascending=False)
+    print("\n" + "=" * 104)
+    print(f"PORTFOLIO LEADERBOARD  (daily top-{PORT_TOP_K} / max {PORT_MAX_CONCURRENT} concurrent, "
+          f"equal sleeve, {COST_BPS}bps, OOS)")
+    print("=" * 104)
+    print(f"  {'combo':<18}{'Trades':>8}{'CAGR%':>9}{'Sharpe':>8}{'MaxDD%':>9}"
+          f"{'Expo%':>8}{'Win%':>7}{'FinalEq':>9}")
+    for _, r in po.head(15).iterrows():
+        print(f"  {r['combo']:<18}{r['n_trades']:>8,}{r['cagr_pct']:>+9.2f}{r['sharpe_annual']:>8.2f}"
+              f"{r['max_drawdown_pct']:>+9.2f}{r['exposure_pct']:>8.1f}{r['port_win_rate_pct']:>7.1f}"
+              f"{r['final_equity']:>9.3f}")
+
+    # ---- console: PORTFOLIO by probability bucket (primary combo, OOS) ----
+    pb = port_bucket_df[(port_bucket_df["scope"] == "OOS") & (port_bucket_df["n_trades"] > 0)].sort_values("bucket")
+    print("\n" + "=" * 104)
+    print(f"PORTFOLIO by PROB BUCKET  (primary combo TP{PRIMARY_TP_PCT:.0%}/SL{PRIMARY_SL_PCT:.0%}, "
+          f"top-{PORT_TOP_K}/max-{PORT_MAX_CONCURRENT}, OOS)")
+    print("=" * 104)
+    print(f"  {'bucket':<16}{'Trades':>8}{'CAGR%':>9}{'Sharpe':>8}{'MaxDD%':>9}{'Expo%':>8}{'Win%':>7}")
+    for _, r in pb.iterrows():
+        print(f"  {r['bucket']:<16}{r['n_trades']:>8,}{r['cagr_pct']:>+9.2f}{r['sharpe_annual']:>8.2f}"
+              f"{r['max_drawdown_pct']:>+9.2f}{r['exposure_pct']:>8.1f}{r['port_win_rate_pct']:>7.1f}")
+
     print("\n" + "=" * 104)
     print(f"OUTPUTS in {OUT_DIR}")
     print("  01_grid_overall.csv         - every TP/SL combo, Full + OOS")
     print("  02_grid_x_probbucket.csv    - every combo x 5% prob bucket")
     print("  03_grid_x_regime.csv        - every combo x regime")
     print("  04_trades_primary_TP5_SL3.csv - per-trade detail (MAE/MFE/timing)")
+    print("  05_portfolio_overall.csv      - top-5/max-5 portfolio per combo (CAGR/Sharpe/maxDD)")
+    print("  06_portfolio_x_probbucket.csv - PORTFOLIO by 5% prob bucket (primary combo)")
+    print("  07_portfolio_equity_primary_oos.csv - daily equity curve (primary combo, OOS)")
     print("=" * 104)
     print("\nTo COMPARE binary vs rank: run this twice with BASE_DIR pointed at each")
     print("model's output folder, then diff 01_grid_overall.csv (scope=OOS).")
