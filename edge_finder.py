@@ -33,14 +33,38 @@ LEAK SAFETY
 
 USAGE
 -----
-    # Real cache panel, all generator families, top-30 features for pairs:
+    # Real cache panel, all generator families, with a reusable panel cache:
     python edge_finder.py --cache-dir /path/to/cache_daily_new --out edge_out \\
+                          --panel-cache panel_cache/panel.parquet \\
                           --start 2018-01-01 --end 2026-05-30 \\
                           --horizons 1,5,10 --pairs-topk 30 \\
                           --max-strategies 3000 --workers 4
 
+    # Re-run with different strategy knobs but SAME panel -> instant cache HIT.
+    # Force a rebuild after recaching the daily data:
+    python edge_finder.py --cache-dir ... --panel-cache panel_cache/panel.parquet \\
+                          --rebuild-panel ...
+
     # Self-test on synthetic data (no real parquets needed):
     python edge_finder.py --self-test --out edge_out_synth
+
+PANEL CACHE
+-----------
+  `--panel-cache PATH` saves the fully assembled panel (per-symbol parquets +
+  forward returns + cross-sectional ranks + all 16 panel WQ alphas + regime
+  columns) to a single parquet, with a `<PATH>.meta.json` sidecar recording the
+  build parameters. Subsequent runs with the same cache_dir / start / end /
+  horizons / max_symbols load it directly and skip reassembly. Use
+  `--rebuild-panel` after you recache the daily data.
+
+WORLDQUANT ALPHAS
+-----------------
+  All 16 alphas are built at panel level as `WQ_<n>_cs`:
+    * the 10 rank-based ones (3,13,16,19,20,29,33,38,40,44) use genuine
+      cross-sectional rank — groupby('timestamp').rank(pct=True) — which the
+      per-symbol cache structurally cannot produce;
+    * the 6 pure time-series ones (6,12,23,26,35,41) are computed per-symbol.
+  All are leak-free (verified by a future-tampering test).
 """
 from __future__ import annotations
 
@@ -219,66 +243,182 @@ def add_cross_sectional_ranks(panel: pd.DataFrame, cols: Sequence[str] = CS_RANK
     return panel
 
 
-def _ts_corr_per_symbol(a: pd.Series, b: pd.Series, sym: pd.Series, w: int) -> pd.Series:
-    """Per-symbol rolling correlation, panel-flattened back."""
-    df = pd.DataFrame({"a": a, "b": b, "sym": sym})
-    return df.groupby("sym", sort=False).apply(
-        lambda g: g["a"].rolling(w, min_periods=max(5, w // 2)).corr(g["b"])
-    ).reset_index(level=0, drop=True).reindex(a.index)
-
-
-def _ts_apply_per_symbol(s: pd.Series, sym: pd.Series, fn: Callable[[pd.Series], pd.Series]) -> pd.Series:
-    df = pd.DataFrame({"s": s, "sym": sym})
-    return df.groupby("sym", sort=False)["s"].transform(fn)
-
-
-def add_panel_wq_alphas(panel: pd.DataFrame) -> pd.DataFrame:
+class _PanelOps:
     """
-    Build the *real* cross-sectional WQ alphas from the cs_rank_* columns
-    that already exist on the panel. The names end in `_cs` to distinguish
-    them from the v20 per-symbol expanding-rank versions in the parquet
-    cache (D_WQ_*).
+    Leak-free panel operators for building WorldQuant alphas.
 
-    Only a subset is built (the ones with cs_rank-friendly inputs already
-    materialized). Add more by computing more cs_rank_* columns first.
+    Time-series ops (ts_*) are computed PER SYMBOL over time (causal rolling /
+    lag), exactly like the WQ literature's `delta`, `delay`, `ts_*`. Cross-
+    sectional ops (cs_rank) are computed PER DAY across the universe via
+    groupby('timestamp') — the genuine WQ `rank()`.
+
+    All series share the working frame's index; everything is reindexed back
+    to the original panel order on assignment.
     """
-    needed = {"cs_rank_open", "cs_rank_volume", "cs_rank_close", "cs_rank_high"}
-    if not needed.issubset(panel.columns):
-        print(f"[panel] skipping cs WQ alphas — need {needed - set(panel.columns)}")
+
+    def __init__(self, w: pd.DataFrame):
+        # `w` is sorted by (symbol, timestamp) with a clean RangeIndex.
+        self.w = w
+        self.sym = w["symbol"]
+        self.ts = w["timestamp"]
+        self._g = w.groupby("symbol", sort=False)
+        self.open = pd.to_numeric(w["open"], errors="coerce")
+        self.high = pd.to_numeric(w["high"], errors="coerce")
+        self.low = pd.to_numeric(w["low"], errors="coerce")
+        self.close = pd.to_numeric(w["close"], errors="coerce")
+        self.volume = pd.to_numeric(w["volume"], errors="coerce")
+        self.vwap = (self.high + self.low + self.close) / 3.0
+        self.ret = self._by_symbol(self.close).pct_change()
+
+    # -- helpers to group an arbitrary aligned series by symbol / timestamp --
+    def _by_symbol(self, s: pd.Series) -> "pd.core.groupby.SeriesGroupBy":
+        return s.groupby(self.sym, sort=False)
+
+    def delay(self, s: pd.Series, d: int) -> pd.Series:
+        return self._by_symbol(s).shift(d)
+
+    def delta(self, s: pd.Series, d: int) -> pd.Series:
+        return s - self._by_symbol(s).shift(d)
+
+    def ts_sum(self, s: pd.Series, n: int) -> pd.Series:
+        return (self._by_symbol(s)
+                .rolling(n, min_periods=max(2, n // 2)).sum()
+                .reset_index(level=0, drop=True).reindex(self.w.index))
+
+    def ts_mean(self, s: pd.Series, n: int) -> pd.Series:
+        return (self._by_symbol(s)
+                .rolling(n, min_periods=max(2, n // 2)).mean()
+                .reset_index(level=0, drop=True).reindex(self.w.index))
+
+    def ts_std(self, s: pd.Series, n: int) -> pd.Series:
+        return (self._by_symbol(s)
+                .rolling(n, min_periods=max(3, n // 2)).std()
+                .reset_index(level=0, drop=True).reindex(self.w.index))
+
+    def ts_max(self, s: pd.Series, n: int) -> pd.Series:
+        return (self._by_symbol(s)
+                .rolling(n, min_periods=max(2, n // 2)).max()
+                .reset_index(level=0, drop=True).reindex(self.w.index))
+
+    def ts_rank(self, s: pd.Series, n: int) -> pd.Series:
+        return (self._by_symbol(s)
+                .rolling(n, min_periods=max(3, n // 2)).rank(pct=True)
+                .reset_index(level=0, drop=True).reindex(self.w.index))
+
+    def ts_corr(self, a: pd.Series, b: pd.Series, n: int) -> pd.Series:
+        tmp = pd.DataFrame({"a": a, "b": b, "sym": self.sym})
+        out = tmp.groupby("sym", sort=False).apply(
+            lambda g: g["a"].rolling(n, min_periods=max(3, n // 2)).corr(g["b"])
+        ).reset_index(level=0, drop=True).reindex(self.w.index)
+        return out
+
+    def ts_cov(self, a: pd.Series, b: pd.Series, n: int) -> pd.Series:
+        tmp = pd.DataFrame({"a": a, "b": b, "sym": self.sym})
+        out = tmp.groupby("sym", sort=False).apply(
+            lambda g: g["a"].rolling(n, min_periods=max(3, n // 2)).cov(g["b"])
+        ).reset_index(level=0, drop=True).reindex(self.w.index)
+        return out
+
+    def cs_rank(self, s: pd.Series) -> pd.Series:
+        """Genuine WorldQuant cross-sectional rank: per-day, across the universe."""
+        return s.groupby(self.ts, sort=False).rank(pct=True)
+
+
+# WorldQuant alphas that REQUIRE a cross-sectional rank (these were the 10
+# leaky ones in the per-symbol cache; here they are computed correctly).
+WQ_CS_ALPHAS: Tuple[int, ...] = (3, 13, 16, 19, 20, 29, 33, 38, 40, 44)
+# WorldQuant alphas that are pure time-series (no cross-sectional op). Built
+# per-symbol; identical whether per-symbol or panel, included for completeness.
+WQ_TS_ALPHAS: Tuple[int, ...] = (6, 12, 23, 26, 35, 41)
+
+
+def add_panel_wq_alphas(panel: pd.DataFrame, which: Optional[Sequence[int]] = None) -> pd.DataFrame:
+    """
+    Build all 16 WorldQuant alphas at panel level under uniform `WQ_<n>_cs`
+    names, leak-free:
+      * the 10 rank-based alphas use genuine cross-sectional rank
+        (groupby('timestamp')) — the WQ semantic the per-symbol cache cannot
+        produce;
+      * the 6 pure time-series alphas are computed per-symbol.
+
+    `which` optionally restricts to a subset of WQ numbers.
+    """
+    req = {"open", "high", "low", "close", "volume"}
+    if not req.issubset(panel.columns):
+        print(f"[panel] skipping WQ alphas — missing {req - set(panel.columns)}")
         return panel
 
-    sym = panel["symbol"]
-    ro = panel["cs_rank_open"]
-    rv = panel["cs_rank_volume"]
-    rc = panel["cs_rank_close"]
-    rh = panel["cs_rank_high"]
+    wanted = set(which) if which is not None else set(WQ_CS_ALPHAS) | set(WQ_TS_ALPHAS)
 
-    # WQ_3_cs : -ts_corr(cs_rank(open), cs_rank(volume), 10)
-    panel["WQ_3_cs"] = (-_ts_corr_per_symbol(ro, rv, sym, 10)).astype("float32")
-    # WQ_44_cs: -ts_corr(high, cs_rank(volume), 5)
-    high = pd.to_numeric(panel["high"], errors="coerce")
-    panel["WQ_44_cs"] = (-_ts_corr_per_symbol(high, rv, sym, 5)).astype("float32")
-    # WQ_40_cs: -cs_rank(ts_std(high,10)) * ts_corr(high, volume, 10)
-    vol = pd.to_numeric(panel["volume"], errors="coerce")
-    ts_std_high_10 = _ts_apply_per_symbol(high, sym, lambda s: s.rolling(10, min_periods=5).std())
-    cs_rank_ts_std_h10 = ts_std_high_10.groupby(panel["timestamp"]).rank(pct=True)
-    ts_corr_hv = _ts_corr_per_symbol(high, vol, sym, 10)
-    panel["WQ_40_cs"] = (-cs_rank_ts_std_h10 * ts_corr_hv).astype("float32")
+    # Build a symbol-time-sorted working frame, remembering original positions.
+    base = panel[["timestamp", "symbol", "open", "high", "low", "close", "volume"]].copy()
+    base["_orig"] = np.arange(len(base), dtype="int64")
+    w = base.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+    op = _PanelOps(w)
 
-    # WQ_38_cs: -cs_rank(ts_rank(close,10)) * cs_rank(close/open)
-    close = pd.to_numeric(panel["close"], errors="coerce")
-    open_ = pd.to_numeric(panel["open"], errors="coerce")
-    ts_rank_c10 = _ts_apply_per_symbol(close, sym, lambda s: s.rolling(10, min_periods=5).rank(pct=True))
-    cs_rank_tsrc10 = ts_rank_c10.groupby(panel["timestamp"]).rank(pct=True)
-    co = (close / open_.replace(0, np.nan))
-    cs_rank_co = co.groupby(panel["timestamp"]).rank(pct=True)
-    panel["WQ_38_cs"] = (-cs_rank_tsrc10 * cs_rank_co).astype("float32")
+    o, h, l, c, v = op.open, op.high, op.low, op.close, op.volume
+    cs = op.cs_rank
+    alphas: Dict[str, pd.Series] = {}
 
-    # WQ_33_cs: cs_rank(-1 + open/close)
-    panel["WQ_33_cs"] = (
-        (-1 + open_ / close.replace(0, np.nan)).groupby(panel["timestamp"]).rank(pct=True)
-    ).astype("float32")
+    # ---- cross-sectional (rank-based) ----
+    if 3 in wanted:
+        alphas["WQ_3_cs"] = -op.ts_corr(cs(o), cs(v), 10)
+    if 13 in wanted:
+        alphas["WQ_13_cs"] = -cs(op.ts_cov(cs(c), cs(v), 5))
+    if 16 in wanted:
+        alphas["WQ_16_cs"] = -cs(op.ts_cov(cs(h), cs(v), 5))
+    if 19 in wanted:
+        d7 = op.delay(c, 7)
+        part = -np.sign(op.delta(c - d7, 5) + op.delta(c, 5))
+        ret_sum = op.ts_sum(op.ret, 250)
+        alphas["WQ_19_cs"] = part * (1 + cs(1 + ret_sum))
+    if 20 in wanted:
+        alphas["WQ_20_cs"] = (
+            -cs(o - op.delay(h, 1)) * cs(o - op.delay(c, 1)) * cs(o - op.delay(l, 1))
+        )
+    if 29 in wanted:
+        alphas["WQ_29_cs"] = cs(cs(-cs(op.delta(c, 5))))
+    if 33 in wanted:
+        alphas["WQ_33_cs"] = cs(-1 + o / c.replace(0, np.nan))
+    if 38 in wanted:
+        alphas["WQ_38_cs"] = -cs(op.ts_rank(c, 10)) * cs(c / o.replace(0, np.nan))
+    if 40 in wanted:
+        alphas["WQ_40_cs"] = -cs(op.ts_std(h, 10)) * op.ts_corr(h, v, 10)
+    if 44 in wanted:
+        alphas["WQ_44_cs"] = -op.ts_corr(h, cs(v), 5)
 
+    # ---- pure time-series (no cross-sectional op) ----
+    if 6 in wanted:
+        alphas["WQ_6_cs"] = -op.ts_corr(o, v, 10)
+    if 12 in wanted:
+        alphas["WQ_12_cs"] = np.sign(op.delta(v, 1)) * (-op.delta(c, 1))
+    if 23 in wanted:
+        cond = op.ts_mean(h, 20) < h
+        alphas["WQ_23_cs"] = (-op.delta(h, 2)).where(cond, 0.0)
+    if 26 in wanted:
+        inner = op.ts_corr(op.ts_rank(v, 5), op.ts_rank(h, 5), 5)
+        alphas["WQ_26_cs"] = -op.ts_max(inner, 3)
+    if 35 in wanted:
+        alphas["WQ_35_cs"] = (
+            op.ts_rank(v, 32)
+            * (1 - op.ts_rank(c + h - l, 16))
+            * (1 - op.ts_rank(op.ret, 32))
+        )
+    if 41 in wanted:
+        alphas["WQ_41_cs"] = np.sqrt(h * l) - op.vwap
+
+    # Map every alpha back to the original panel order via `_orig`.
+    orig = w["_orig"].to_numpy()
+    n = len(panel)
+    built: List[str] = []
+    for name, series in alphas.items():
+        vals = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).to_numpy()
+        out = np.full(n, np.nan, dtype="float64")
+        out[orig] = vals
+        panel[name] = out.astype("float32")
+        built.append(name)
+
+    print(f"[panel] built {len(built)} WQ alphas: {', '.join(sorted(built))}")
     return panel
 
 
@@ -332,6 +472,105 @@ def add_regime_columns(panel: pd.DataFrame) -> pd.DataFrame:
     out["reg_dow"] = out["timestamp"].dt.dayofweek.astype("int8")
     out["reg_year"] = out["timestamp"].dt.year.astype("int16")
     return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Section 1b: Panel assembly + caching
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Bump when the assembly logic changes in a way that invalidates cached panels.
+PANEL_CACHE_VERSION = 2
+
+
+def assemble_panel(
+    cache_dir: Path | str,
+    *,
+    start: Optional[dt.date] = None,
+    end: Optional[dt.date] = None,
+    horizons: Sequence[int] = DEFAULT_HORIZONS,
+    max_symbols: Optional[int] = None,
+    wq_alphas: Optional[Sequence[int]] = None,
+) -> pd.DataFrame:
+    """Full feature-engineered panel: load + forward returns + cs ranks +
+    all 16 WQ alphas + regime columns. This is the expensive step the panel
+    cache stores."""
+    panel = load_panel(cache_dir, start=start, end=end, max_symbols=max_symbols)
+    panel = add_forward_returns(panel, horizons=horizons)
+    panel = add_cross_sectional_ranks(panel, CS_RANK_INPUT_COLS)
+    panel = add_panel_wq_alphas(panel, which=wq_alphas)
+    panel = add_regime_columns(panel)
+    return panel
+
+
+def _panel_cache_meta(
+    cache_dir: Path | str, start, end, horizons, max_symbols
+) -> Dict[str, Any]:
+    return {
+        "panel_cache_version": PANEL_CACHE_VERSION,
+        "cache_dir": str(Path(cache_dir).resolve()),
+        "start": str(start) if start else None,
+        "end": str(end) if end else None,
+        "horizons": list(int(h) for h in horizons),
+        "max_symbols": int(max_symbols) if max_symbols else None,
+    }
+
+
+def get_panel(
+    cache_dir: Path | str,
+    *,
+    start: Optional[dt.date] = None,
+    end: Optional[dt.date] = None,
+    horizons: Sequence[int] = DEFAULT_HORIZONS,
+    max_symbols: Optional[int] = None,
+    wq_alphas: Optional[Sequence[int]] = None,
+    panel_cache: Optional[Path | str] = None,
+    rebuild_panel: bool = False,
+) -> pd.DataFrame:
+    """
+    Return the feature-engineered panel, using a parquet panel cache when
+    available and valid.
+
+    The cache is a single parquet (`panel_cache`) plus a `<panel_cache>.meta.json`
+    sidecar recording the build parameters. If the sidecar matches the current
+    request (same cache_dir / start / end / horizons / max_symbols / version)
+    and `rebuild_panel` is False, the cached parquet is loaded directly —
+    skipping the expensive multi-file read + cs-rank + WQ-alpha assembly.
+    """
+    if panel_cache is None:
+        return assemble_panel(cache_dir, start=start, end=end, horizons=horizons,
+                              max_symbols=max_symbols, wq_alphas=wq_alphas)
+
+    panel_cache = Path(panel_cache)
+    meta_path = panel_cache.with_suffix(panel_cache.suffix + ".meta.json")
+    want_meta = _panel_cache_meta(cache_dir, start, end, horizons, max_symbols)
+
+    if not rebuild_panel and panel_cache.exists() and meta_path.exists():
+        try:
+            have_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            have_meta = None
+        if have_meta == want_meta:
+            print(f"[panel-cache] HIT -> loading {panel_cache}")
+            panel = pd.read_parquet(panel_cache)
+            print(f"[panel-cache] loaded rows={len(panel):,} cols={len(panel.columns)}")
+            return panel
+        else:
+            print("[panel-cache] STALE (params changed) -> rebuilding")
+    elif rebuild_panel:
+        print("[panel-cache] rebuild requested -> rebuilding")
+    else:
+        print("[panel-cache] MISS -> building")
+
+    panel = assemble_panel(cache_dir, start=start, end=end, horizons=horizons,
+                           max_symbols=max_symbols, wq_alphas=wq_alphas)
+    panel_cache.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        panel.to_parquet(panel_cache, index=False)
+        meta_path.write_text(json.dumps(want_meta, indent=2), encoding="utf-8")
+        print(f"[panel-cache] saved -> {panel_cache}")
+    except Exception as e:
+        print(f"[panel-cache] WARN could not save cache: {e}")
+    return panel
 
 
 def pick_feature_columns(
@@ -1364,6 +1603,10 @@ def _run_self_test(out_dir: Path) -> None:
     panel = add_panel_wq_alphas(panel)
     panel = add_regime_columns(panel)
 
+    n_wq = len([c for c in panel.columns if c.startswith("WQ_") and c.endswith("_cs")])
+    print(f"[selftest] WQ alphas built on panel: {n_wq} (expected 16)")
+    assert n_wq == 16, f"expected 16 WQ alphas, got {n_wq}"
+
     feats = pick_feature_columns(panel, max_features=60)
     print(f"[selftest] panel rows={len(panel):,}  features={len(feats)}")
 
@@ -1428,6 +1671,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap.add_argument("--regime-detail-topk", type=int, default=100,
                     help="Compute regime breakdowns + bootstrap CIs only for the top-K by |IC IR|")
     ap.add_argument("--out", type=str, default="edge_finder_out")
+    ap.add_argument("--panel-cache", type=str, default=None,
+                    help="Path to a panel-cache parquet. If set, the assembled "
+                         "panel (cs-ranks + WQ alphas + regimes) is saved here and "
+                         "reused on subsequent runs with the same parameters.")
+    ap.add_argument("--rebuild-panel", action="store_true",
+                    help="Force rebuilding the panel cache even if a valid one exists.")
     ap.add_argument("--top-n", type=int, default=50)
     ap.add_argument("--self-test", action="store_true",
                     help="Run on a synthetic panel; no real cache needed")
@@ -1449,17 +1698,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     horizons = tuple(int(x.strip()) for x in args.horizons.split(",") if x.strip())
 
-    # 1) Panel
-    panel = load_panel(
+    # 1) Panel (cached when --panel-cache is given)
+    panel = get_panel(
         args.cache_dir,
         start=pd.Timestamp(args.start).date() if args.start else None,
         end=pd.Timestamp(args.end).date() if args.end else None,
+        horizons=horizons,
         max_symbols=args.max_symbols,
+        panel_cache=args.panel_cache,
+        rebuild_panel=args.rebuild_panel,
     )
-    panel = add_forward_returns(panel, horizons=horizons)
-    panel = add_cross_sectional_ranks(panel, CS_RANK_INPUT_COLS)
-    panel = add_panel_wq_alphas(panel)
-    panel = add_regime_columns(panel)
 
     # 2) Features
     feats = pick_feature_columns(panel, max_features=args.max_features)

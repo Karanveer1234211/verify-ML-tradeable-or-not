@@ -148,6 +148,98 @@ def test_no_lookahead_in_cs_rank():
     print(f"  cs_rank no-lookahead: max past diff = {diff:.2e}  OK")
 
 
+def _synth_ohlcv_panel(n_sym=12, n_days=120, seed=11):
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range("2021-01-01", periods=n_days, freq="B")
+    rows = []
+    for s in range(n_sym):
+        close = 100 * np.exp(np.cumsum(rng.normal(0, 0.012, n_days)))
+        op = close * (1 + rng.normal(0, 0.003, n_days))
+        hi = np.maximum(close, op) * (1 + np.abs(rng.normal(0, 0.005, n_days)))
+        lo = np.minimum(close, op) * (1 - np.abs(rng.normal(0, 0.005, n_days)))
+        vol = rng.integers(1e5, 1e6, n_days).astype(float)
+        rows.append(pd.DataFrame({"timestamp": dates, "symbol": f"S{s:02d}",
+                                  "open": op, "high": hi, "low": lo,
+                                  "close": close, "volume": vol}))
+    return pd.concat(rows, ignore_index=True).sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+
+
+def test_panel_wq_alphas_count_and_finite():
+    # 300+ days so the 250-window alpha (WQ_19) clears its min_periods warmup.
+    panel = _synth_ohlcv_panel(n_sym=12, n_days=320)
+    panel = ef.add_panel_wq_alphas(panel)
+    wq = [c for c in panel.columns if c.startswith("WQ_") and c.endswith("_cs")]
+    assert len(wq) == 16, f"expected 16 WQ alphas, got {len(wq)}: {sorted(wq)}"
+    # each alpha should have a meaningful number of finite values (post warmup)
+    for c in wq:
+        finite = int(np.isfinite(pd.to_numeric(panel[c], errors="coerce")).sum())
+        assert finite > 100, f"{c} has too few finite values ({finite})"
+    print(f"  panel WQ alphas: built {len(wq)}, all populated  OK")
+
+
+def test_wq_cs_no_lookahead():
+    """A WQ_*_cs value at (symbol, day t) must not change when only FUTURE
+    rows (day > t) are mutated. Validates both the per-symbol ts ops and the
+    per-day cross-sectional ranks are causal."""
+    panel = _synth_ohlcv_panel(n_sym=12, n_days=420, seed=3)
+    dates = np.sort(panel["timestamp"].unique())
+    cut = dates[360]
+    a = ef.add_panel_wq_alphas(panel.copy())
+    tamp = panel.copy()
+    fut = tamp["timestamp"] >= cut
+    rng = np.random.default_rng(0)
+    for col in ["open", "high", "low", "close", "volume"]:
+        tamp.loc[fut, col] = tamp.loc[fut, col].to_numpy() * rng.uniform(0.3, 3.0, int(fut.sum()))
+    b = ef.add_panel_wq_alphas(tamp)
+    past = panel["timestamp"] < cut
+    wq = [c for c in a.columns if c.startswith("WQ_") and c.endswith("_cs")]
+    worst = 0.0
+    worst_col = None
+    for c in wq:
+        av = pd.to_numeric(a.loc[past, c], errors="coerce").to_numpy()
+        bv = pd.to_numeric(b.loc[past, c], errors="coerce").to_numpy()
+        an, bn = np.isnan(av), np.isnan(bv)
+        assert np.array_equal(an, bn), f"{c}: NaN pattern changed in the past"
+        d = float(np.nanmax(np.where(an, 0.0, np.abs(av - bv))) if (~an).any() else 0.0)
+        if d > worst:
+            worst, worst_col = d, c
+    assert worst < 1e-6, f"WQ cs alpha leaked future: {worst_col} max past diff = {worst}"
+    print(f"  WQ_*_cs no-lookahead: worst past diff = {worst:.2e} ({worst_col})  OK")
+
+
+def test_panel_cache_roundtrip(tmp_dir="_pc_test"):
+    """get_panel must MISS then HIT, and return identical data from cache."""
+    import os, shutil
+    base = tmp_dir
+    cache_dir = os.path.join(base, "cache_daily")
+    os.makedirs(cache_dir, exist_ok=True)
+    try:
+        # Write per-symbol parquets (need >=250 rows to survive load filter)
+        p = _synth_ohlcv_panel(n_sym=8, n_days=300, seed=5)
+        for sym, g in p.groupby("symbol"):
+            g.drop(columns=["symbol"]).to_parquet(os.path.join(cache_dir, f"{sym}_daily.parquet"), index=False)
+        pc = os.path.join(base, "panel.parquet")
+        # First call: MISS -> builds + saves
+        panel1 = ef.get_panel(cache_dir, horizons=(1, 5), panel_cache=pc)
+        assert os.path.exists(pc) and os.path.exists(pc + ".meta.json")
+        # Second call: HIT -> loads cached parquet
+        panel2 = ef.get_panel(cache_dir, horizons=(1, 5), panel_cache=pc)
+        assert panel1.shape == panel2.shape, f"shape mismatch {panel1.shape} vs {panel2.shape}"
+        # Values identical for a WQ alpha column
+        wqcol = [c for c in panel1.columns if c.startswith("WQ_") and c.endswith("_cs")][0]
+        a = pd.to_numeric(panel1[wqcol], errors="coerce").to_numpy()
+        b = pd.to_numeric(panel2[wqcol], errors="coerce").to_numpy()
+        an, bn = np.isnan(a), np.isnan(b)
+        assert np.array_equal(an, bn)
+        assert float(np.nanmax(np.where(an, 0.0, np.abs(a - b)))) < 1e-6
+        # Stale detection: different horizons must rebuild (params changed)
+        panel3 = ef.get_panel(cache_dir, horizons=(1, 5, 10), panel_cache=pc)
+        assert "ret_h10" in panel3.columns
+        print(f"  panel cache roundtrip: MISS->HIT identical, stale-detect OK  ({panel1.shape[0]} rows)")
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
 def main():
     print("EDGE FINDER METRIC TESTS")
     print("-" * 50)
