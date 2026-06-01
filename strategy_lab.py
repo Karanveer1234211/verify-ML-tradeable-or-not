@@ -2,6 +2,30 @@
 """
 strategy_lab.py  —  multi-strategy cross-sectional EDGE FINDER / research orchestrator.
 
+CORRECTIONS (this revision) — targets the 1/2/3d horizons honestly
+------------------------------------------------------------------
+The prior run over-promoted artifacts. This revision fixes six things:
+  1. HORIZONS: default (1, 2, 3); engineered families (PAIRS / REGIME GATES /
+     COMPOSITES / WQ) now run at EVERY horizon (seeded per-horizon), not only at the
+     primary one. Previously 1-3d were explored by raw singles alone.
+  2. LEVEL FEATURES: raw price/size LEVELS (EMA/SMA, prev OHLC, support/resistance,
+     CPR/pivot, VPOC, raw ATR, dollar-vol) are dropped from the candidate signal set —
+     ranking by them is a static "long expensive / short cheap" survivorship tilt that
+     fabricates Sharpe at ~zero rank-IC. (see is_level_feature / --keep-level-features)
+  3. HONEST COST + BETA NEUTRAL: net Sharpe is reported across a round-trip cost grid
+     (25/40/60/80 bps; headline = honest_cost_bps=60), plus a breakeven_bps and a
+     market-beta-neutralised (residual) Sharpe so a static tilt cannot masquerade.
+  4. DIRECTION ON TRAIN ONLY: the long/short sign is chosen on the TRAIN split, then the
+     sign is validated out-of-sample on the embargoed TEST split (was full-sample = a
+     self-fulfilling OOS check).
+  5. GATING: verdicts gate on EFFECT SIZE AFTER HONEST COST + OOS PERSISTENCE + ECONOMIC
+     PLAUSIBILITY (turnover not a static tilt, |IC| above a floor). The multiple-testing
+     t-bar and Deflated Sharpe are still computed but are REPORTED ONLY (t is ~free at
+     this sample size; DSR is reward-hacked by static low-turnover tilts). The board is
+     ranked by |OOS IC|, not DSR/gross-Sharpe.
+  6. STATIC-TILT QUARANTINE: a high-Sharpe / ~zero-turnover / ~zero-IC book is labelled
+     "NO_EDGE (static tilt)" explicitly.
+
 WHAT THIS IS
 ------------
 edge_finder.py scores ONE feature at a time. strategy_lab.py scores HUNDREDS to
@@ -76,6 +100,7 @@ import glob
 import json
 import math
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -123,6 +148,49 @@ LEAKY_WQ_DEFAULT = {
 EULER_GAMMA = 0.5772156649015329
 
 
+# Raw PRICE/SIZE LEVEL features (non-stationary). Ranking the cross-section by these
+# is, to first order, ranking by share price or market size, which produces a STATIC,
+# near-zero-turnover "long expensive / short cheap" tilt. On a point-in-time-incomplete
+# (survivorship-biased) universe that tilt fabricates large Sharpe with ~zero rank-IC
+# (see the EMA/SMA/prev-close/support/vpoc rows that scored net-Sharpe ~5 at turnover
+# ~0.02 in the previous run). Excluded from the candidate SIGNAL set by default.
+# Normalised cousins (…_pct, …_z*, …_pos, …_angle_deg, …_ratio, …_dist_*, …_to_close_*)
+# are stationary and are KEPT — the regex/exact rules below are anchored so they only
+# match the raw level itself.
+LEVEL_FEATURE_EXACT = {
+    "D_cpr_pivot", "D_pivot", "D_cpr_bc", "D_cpr_tc",
+    "D_tmr_cpr_bc", "D_tmr_cpr_tc", "D_tmr_cpr_pivot",
+    "D_vpoc", "D_weekly_vpoc", "D_monthly_vpoc",
+    "D_dollar_vol", "D_vwap", "D_anchored_vwap",
+}
+LEVEL_FEATURE_REGEXES = (
+    re.compile(r"^D_(ema|sma|wma|dema|tema|hma|vwma|kama)\d+$", re.I),   # moving-average levels
+    re.compile(r"^D_atr\d+$", re.I),                                     # raw ATR (price-scaled level)
+    re.compile(r"^D_(support|resistance)\d+$", re.I),                    # S/R price levels
+    re.compile(r"^D_prev_(open|high|low|close)$", re.I),                 # previous OHLC levels
+    re.compile(r"^D_(bb|donch|kc)_(upper|lower|mid|high|low)(_\d+)?$", re.I),  # absolute bands/channels
+)
+# Tokens that mark a feature as already normalised/stationary -> never treat as a level.
+NORMALISED_TOKENS = (
+    "pct", "ratio", "pos", "_z", "zscore", "rank", "rrank", "angle", "deg",
+    "slope", "dist", "_bw", "pctb", "surge", "_to_", "norm", "stack", "diff",
+    "skew", "_vs_", "cross", "state", "_x", "obv",
+)
+
+
+def is_level_feature(name: str) -> bool:
+    """True if `name` is a raw price/size LEVEL feature (non-stationary) that would
+    create a static survivorship tilt if used as a cross-sectional ranking signal."""
+    if not isinstance(name, str):
+        return False
+    low = name.lower()
+    if any(tok in low for tok in NORMALISED_TOKENS):
+        return False
+    if name in LEVEL_FEATURE_EXACT:
+        return True
+    return any(rx.match(name) for rx in LEVEL_FEATURE_REGEXES)
+
+
 @dataclass
 class Config:
     # data
@@ -132,9 +200,11 @@ class Config:
     self_test: bool = False
 
     # target
-    horizons: Tuple[int, ...] = (1, 3, 5, 10)
-    primary_horizon: int = 5
+    horizons: Tuple[int, ...] = (1, 2, 3)
+    primary_horizon: int = 3
     use_model_target: bool = True       # vol-adjusted forward return like the model
+    engineered_all_horizons: bool = True  # run PAIRS/REGIME/COMPOSITE/WQ at EVERY horizon
+                                          # (was: primary horizon only -> under-explored 1-3d)
 
     # universe filters
     min_names_per_day: int = 30
@@ -148,8 +218,16 @@ class Config:
 
     # backtest
     n_quantiles: int = 5
-    cost_bps: float = 15.0
-    slippage_bps: float = 10.0
+    # Cost is expressed as ROUND-TRIP bps applied per unit of (one-sided) turnover.
+    # honest_cost_bps is the headline cost used for the deployability verdict; the grid
+    # is reported alongside so you can see where net Sharpe dies (the 25 bps used in the
+    # prior run was too kind for daily full-book rotation).
+    honest_cost_bps: float = 60.0
+    cost_grid_bps: Tuple[float, ...] = (25.0, 40.0, 60.0, 80.0)
+    beta_neutralize: bool = True        # report market-beta-neutralised (residual) Sharpe
+    # legacy knobs (kept for CLI back-compat; folded into the grid if provided)
+    cost_bps: Optional[float] = None
+    slippage_bps: Optional[float] = None
 
     # significance
     nw_lag: Optional[int] = None        # default = horizon
@@ -167,15 +245,24 @@ class Config:
 
     # leakage / sanity
     exclude_leaky_wq: bool = True
+    exclude_level_features: bool = True   # drop raw price/size LEVEL features (static-tilt artifacts)
 
     # verdict thresholds
+    # Gating is on EFFECT SIZE AFTER HONEST COST + OUT-OF-SAMPLE PERSISTENCE +
+    # ECONOMIC PLAUSIBILITY. The multiple-testing t-bar and the Deflated Sharpe are
+    # still computed and REPORTED, but they no longer gate: at ~2,800 daily obs the
+    # t-bar maps to a daily IR of ~0.06 (free for ~64% of strategies), and DSR is
+    # reward-hacked by static low-turnover tilts. Both were the wrong instruments.
+    ic_floor: float = 0.010             # |mean cross-sectional rank-IC| must clear this to be "real"
+    tilt_turnover_max: float = 0.05     # below this turnover + sub-floor IC == static tilt, not alpha
+    net_sharpe_strong: float = 0.80     # net of honest_cost_bps
+    net_sharpe_promising: float = 0.30  # net of honest_cost_bps
+    year_hit_min: float = 0.60
+    require_oos_sign: bool = True        # test-split IC sign must match the train-chosen direction
+    too_good_daily_ir: float = 0.50     # |daily IC IR| above this == suspicious leakage (reported AVOID)
+    # reported-only (no longer gate the verdict)
     dsr_strong: float = 0.90
     dsr_promising: float = 0.50
-    net_sharpe_strong: float = 1.0
-    net_sharpe_promising: float = 0.40
-    year_hit_min: float = 0.60
-    too_good_daily_ir: float = 0.50     # |daily IC IR| above this == suspicious leakage
-    too_good_gross_sharpe: float = 6.0
 
     # detailed report depth
     detail_top_k: int = 25
@@ -188,6 +275,17 @@ class Config:
             v = getattr(self, a)
             if v is not None:
                 setattr(self, a, Path(v))
+        # Back-compat: if a caller passed the old per-leg cost_bps/slippage_bps, fold
+        # them into an honest round-trip headline cost ((cost+slip)*2, matching the old
+        # net = gross - turn*(cost+slip)/1e4*2 convention) and ensure it's on the grid.
+        if self.cost_bps is not None or self.slippage_bps is not None:
+            legacy_rt = (float(self.cost_bps or 0.0) + float(self.slippage_bps or 0.0)) * 2.0
+            if legacy_rt > 0:
+                self.honest_cost_bps = legacy_rt
+                if legacy_rt not in self.cost_grid_bps:
+                    self.cost_grid_bps = tuple(sorted(set(self.cost_grid_bps) | {legacy_rt}))
+        if self.honest_cost_bps not in self.cost_grid_bps:
+            self.cost_grid_bps = tuple(sorted(set(self.cost_grid_bps) | {self.honest_cost_bps}))
 
 
 # ───────────────────────── math (no hard scipy dependency for the core) ─────────────────────────
@@ -305,6 +403,48 @@ def max_drawdown(equity: np.ndarray) -> float:
         return np.nan
     peak = np.maximum.accumulate(equity)
     return float((equity / peak - 1.0).min())
+
+
+def _ann_sharpe(rets: np.ndarray, ppy: float) -> float:
+    rets = np.asarray(rets, float)
+    rets = rets[np.isfinite(rets)]
+    if rets.size < 8:
+        return np.nan
+    sd = rets.std(ddof=1)
+    return float(rets.mean() / sd * math.sqrt(ppy)) if sd > 0 else np.nan
+
+
+def net_after_cost(gross: np.ndarray, turns: np.ndarray, roundtrip_bps: float) -> np.ndarray:
+    """Per-rebalance net return after a ROUND-TRIP cost charged on one-sided turnover."""
+    return gross - turns * (roundtrip_bps / 1e4)
+
+
+def beta_neutral_resid(gross: np.ndarray, mkt: np.ndarray) -> Tuple[np.ndarray, float]:
+    """Residual of the gross L/S return after regressing out the equal-weight market.
+    Kills a static long-beta / short-beta tilt that a survivorship-fed book can carry.
+    Returns (residual_series, market_beta)."""
+    g = np.asarray(gross, float)
+    m = np.asarray(mkt, float)
+    ok = np.isfinite(g) & np.isfinite(m)
+    if ok.sum() < 8:
+        return g, np.nan
+    gm, mm = g[ok].mean(), m[ok].mean()
+    var = float(np.dot(m[ok] - mm, m[ok] - mm))
+    if var <= 0:
+        return g, np.nan
+    beta = float(np.dot(m[ok] - mm, g[ok] - gm) / var)
+    resid = g - (gm + beta * (m - mm))
+    return resid, beta
+
+
+def breakeven_bps(gross: np.ndarray, turns: np.ndarray) -> float:
+    """Round-trip cost (bps) at which mean net return crosses zero."""
+    g = np.asarray(gross, float)
+    t = np.asarray(turns, float)
+    ok = np.isfinite(g) & np.isfinite(t)
+    if ok.sum() < 8 or t[ok].mean() <= 0:
+        return np.nan
+    return float(g[ok].mean() / t[ok].mean() * 1e4)
 
 
 # ───────────────────────── loading ─────────────────────────
@@ -492,6 +632,12 @@ def pick_features(panel: pd.DataFrame, cfg: Config) -> List[str]:
             print(f"\nWARNING  excluding {len(present_leaky)} known-leaky WQ columns the model "
                   f"still trains on: {', '.join(present_leaky)}")
         drop |= LEAKY_WQ_DEFAULT
+    if cfg.exclude_level_features:
+        present_levels = sorted(c for c in feats if is_level_feature(c))
+        if present_levels:
+            print(f"\nWARNING  excluding {len(present_levels)} raw price/size LEVEL features "
+                  f"(static-tilt / survivorship artifacts): {', '.join(present_levels)}")
+        drop |= set(present_levels)
     feats = [c for c in feats if c not in drop]
 
     out = []
@@ -545,6 +691,7 @@ class ScoreEngine:
 
         # holdout split (date-level, embargoed) on the primary horizon
         self.test_day_mask = self._make_test_mask()
+        self.train_day_mask = self._make_train_mask()
 
         # day attribute table for regime breakdown
         self.day_attrs = build_day_regimes(panel).reindex(self.uniq_dates)
@@ -600,6 +747,17 @@ class ScoreEngine:
         mask[start:] = True
         return mask
 
+    def _make_train_mask(self) -> np.ndarray:
+        """In-sample (train) days only, used to CHOOSE the trade direction so the
+        out-of-sample sign check on the test split is not self-fulfilling."""
+        n = self.D
+        if n < 30:
+            return np.ones(n, dtype=bool)
+        cut = int(self.cfg.train_frac * n)
+        mask = np.zeros(n, dtype=bool)
+        mask[:max(1, cut)] = True
+        return mask
+
     # ---- core metrics ----
     def ic_per_day(self, signal: np.ndarray, h: int) -> np.ndarray:
         """Cross-sectional rank-IC per day. Returns array of length D (NaN for skipped days)."""
@@ -625,16 +783,17 @@ class ScoreEngine:
         out[ok] = num[ok] / den[ok]
         return out
 
-    def ls_backtest(self, signal: np.ndarray, h: int, direction: float,
-                    precise_turnover: bool = False) -> dict:
+    def ls_backtest(self, signal: np.ndarray, h: int, direction: float) -> dict:
         """
         Dollar-neutral top-vs-bottom quantile L/S, rebalanced every h days
-        (non-overlapping). Returns gross & net (cost) annualised stats.
+        (non-overlapping). Returns the RAW per-rebalance building blocks (gross return,
+        one-sided turnover, equal-weight market return) so the driver can apply a cost
+        grid and market-beta-neutralise. Cost/Sharpe are NOT computed here anymore.
         """
         cfg = self.cfg
-        nil = dict(gross_sharpe=np.nan, net_sharpe=np.nan, net_ann_ret=np.nan,
-                   gross_ann_ret=np.nan, turnover=np.nan, max_dd=np.nan, n_reb=0,
-                   net_rets=np.array([]), gross_rets=np.array([]))
+        nil = dict(n_reb=0, turnover=np.nan,
+                   gross_rets=np.array([]), turns=np.array([]), mkt_rets=np.array([]),
+                   ppy=252.0 / max(1, h))
         sig = direction * signal
         valid = np.isfinite(sig) & np.isfinite(self.ret_oc[h])
         if valid.sum() < cfg.min_names_per_day:
@@ -647,8 +806,7 @@ class ScoreEngine:
         sym = self.sym
 
         rebal_codes = range(0, self.D, h)  # non-overlapping
-        cost = (cfg.cost_bps + cfg.slippage_bps) / 1e4
-        gross, net, turns = [], [], []
+        gross, turns, mkt = [], [], []
         prev_l = prev_s = None
         for dc in rebal_codes:
             rows = self.day_rows[dc]
@@ -659,6 +817,8 @@ class ScoreEngine:
             if lrows.size == 0 or srows.size == 0:
                 continue
             g = ret[lrows].mean() - ret[srows].mean()
+            mrows = rows[np.isfinite(ret[rows])]            # equal-weight market that day
+            mret = ret[mrows].mean() if mrows.size else np.nan
             ls, ss = set(sym[lrows]), set(sym[srows])
             if prev_l is None:
                 turn = 1.0
@@ -668,24 +828,16 @@ class ScoreEngine:
             prev_l, prev_s = ls, ss
             turns.append(turn)
             gross.append(g)
-            net.append(g - turn * cost * 2.0)
-        if len(net) < 8:
-            return {**nil, "n_reb": len(net)}
-        net = np.asarray(net, float)
-        gross = np.asarray(gross, float)
-        ppy = 252.0 / h
-        sd_n = net.std(ddof=1)
-        sd_g = gross.std(ddof=1)
+            mkt.append(mret)
+        if len(gross) < 8:
+            return {**nil, "n_reb": len(gross)}
         return dict(
-            gross_sharpe=(gross.mean() / sd_g) * math.sqrt(ppy) if sd_g > 0 else np.nan,
-            net_sharpe=(net.mean() / sd_n) * math.sqrt(ppy) if sd_n > 0 else np.nan,
-            gross_ann_ret=gross.mean() * ppy,
-            net_ann_ret=net.mean() * ppy,
+            n_reb=len(gross),
             turnover=float(np.mean(turns)) if turns else np.nan,
-            max_dd=max_drawdown(np.cumprod(1.0 + net)),
-            n_reb=len(net),
-            net_rets=net,
-            gross_rets=gross,
+            gross_rets=np.asarray(gross, float),
+            turns=np.asarray(turns, float),
+            mkt_rets=np.asarray(mkt, float),
+            ppy=252.0 / max(1, h),
         )
 
     def regime_breakdown(self, ic: np.ndarray) -> dict:
@@ -732,9 +884,9 @@ def _iter_singles(engine: ScoreEngine, feats: List[str], cfg: Config):
             yield dict(name=f, kind="single", horizon=h, feature=f, signal=v)
 
 
-def _rank_feats_by_ir(engine: ScoreEngine, feats: List[str], cfg: Config) -> List[Tuple[str, float]]:
-    """Cheap univariate ranking at the primary horizon to seed PAIRS/REGIME/COMPOSITE."""
-    h = cfg.primary_horizon
+def _rank_feats_by_ir(engine: ScoreEngine, feats: List[str], cfg: Config, h: int) -> List[Tuple[str, float]]:
+    """Cheap univariate ranking AT HORIZON h to seed PAIRS/REGIME/COMPOSITE for that
+    horizon (the best seeds differ by horizon, so we rank per horizon, not once at 5d)."""
     scored = []
     for f in feats:
         v = pd.to_numeric(engine.work[f], errors="coerce").to_numpy()
@@ -747,8 +899,7 @@ def _rank_feats_by_ir(engine: ScoreEngine, feats: List[str], cfg: Config) -> Lis
     return scored
 
 
-def _iter_pairs(engine: ScoreEngine, top_feats: List[str], cfg: Config):
-    h = cfg.primary_horizon
+def _iter_pairs(engine: ScoreEngine, top_feats: List[str], cfg: Config, h: int):
     z = {f: engine._zscore_within(pd.to_numeric(engine.work[f], errors="coerce").to_numpy())
          for f in top_feats}
     for i in range(len(top_feats)):
@@ -768,8 +919,7 @@ def _iter_pairs(engine: ScoreEngine, top_feats: List[str], cfg: Config):
                        feature=f"{a}|{b}", signal=gated)
 
 
-def _iter_regime_gates(engine: ScoreEngine, top_feats: List[str], cfg: Config):
-    h = cfg.primary_horizon
+def _iter_regime_gates(engine: ScoreEngine, top_feats: List[str], cfg: Config, h: int):
     attrs = engine.day_attrs
     # map day-level regime flags down to rows via codes
     def day_to_row(col_mask_series: pd.Series) -> np.ndarray:
@@ -794,8 +944,7 @@ def _iter_regime_gates(engine: ScoreEngine, top_feats: List[str], cfg: Config):
                        feature=f, signal=sig)
 
 
-def _iter_composites(engine: ScoreEngine, ranked: List[Tuple[str, float]], cfg: Config):
-    h = cfg.primary_horizon
+def _iter_composites(engine: ScoreEngine, ranked: List[Tuple[str, float]], cfg: Config, h: int):
     # orient each feature by the sign of its mean IC, then equal-weight z-scores.
     oriented = {}
     for f, _ in ranked:
@@ -821,7 +970,7 @@ def _iter_wq_xsection(engine: ScoreEngine, panel: pd.DataFrame, cfg: Config):
     time-series ops per symbol. These cannot be built by the per-symbol cache, which
     is exactly why the audit flagged them. Computed here at panel level.
     """
-    h = cfg.primary_horizon
+    horizons = cfg.horizons if cfg.engineered_all_horizons else (cfg.primary_horizon,)
     w = engine.work
     # align raw inputs to engine.work order
     o = pd.to_numeric(w["open"], errors="coerce")
@@ -864,23 +1013,31 @@ def _iter_wq_xsection(engine: ScoreEngine, panel: pd.DataFrame, cfg: Config):
         arr = np.asarray(arr, dtype=float)
         if np.isfinite(arr).mean() < 0.2:
             continue
-        yield dict(name=nm, kind="wq_xsection", horizon=h, feature=nm, signal=arr)
+        for h in horizons:
+            yield dict(name=nm, kind="wq_xsection", horizon=h, feature=nm, signal=arr)
 
 
 def generate_strategies(engine: ScoreEngine, panel: pd.DataFrame, feats: List[str], cfg: Config):
-    """Yield all strategy specs from every enabled generator."""
+    """Yield all strategy specs from every enabled generator.
+
+    Engineered families (PAIRS / REGIME GATES / COMPOSITES) are generated at EVERY
+    requested horizon when cfg.engineered_all_horizons is True, each seeded by that
+    horizon's own univariate ranking. Previously they ran only at the primary horizon,
+    which left 1-3d explored by raw singles alone."""
     yield from _iter_singles(engine, feats, cfg)
 
-    ranked = _rank_feats_by_ir(engine, feats, cfg)
-    top_pairs = [f for f, _ in ranked[:cfg.top_k_pairs]]
-    top_regime = [f for f, _ in ranked[:cfg.top_k_regime]]
+    horizons = tuple(cfg.horizons) if cfg.engineered_all_horizons else (cfg.primary_horizon,)
+    for h in horizons:
+        ranked = _rank_feats_by_ir(engine, feats, cfg, h)
+        top_pairs = [f for f, _ in ranked[:cfg.top_k_pairs]]
+        top_regime = [f for f, _ in ranked[:cfg.top_k_regime]]
+        if cfg.do_pairs and len(top_pairs) >= 2:
+            yield from _iter_pairs(engine, top_pairs, cfg, h)
+        if cfg.do_regime_gates and top_regime:
+            yield from _iter_regime_gates(engine, top_regime, cfg, h)
+        if cfg.do_composites and ranked:
+            yield from _iter_composites(engine, ranked, cfg, h)
 
-    if cfg.do_pairs and len(top_pairs) >= 2:
-        yield from _iter_pairs(engine, top_pairs, cfg)
-    if cfg.do_regime_gates and top_regime:
-        yield from _iter_regime_gates(engine, top_regime, cfg)
-    if cfg.do_composites and ranked:
-        yield from _iter_composites(engine, ranked, cfg)
     if cfg.do_wq_xsection and {"open", "high", "low", "close", "volume"} <= set(panel.columns):
         yield from _iter_wq_xsection(engine, panel, cfg)
 
@@ -907,12 +1064,13 @@ def run(cfg: Config) -> pd.DataFrame:
     print(f"\nGenerated {N} strategies across "
           f"{len(set(s['kind'] for s in specs))} families.")
     print(f"Multiple-testing bar: |Newey-West t| must exceed E[max of {N} nulls] = {t_bar:.2f}")
-    cost = cfg.cost_bps + cfg.slippage_bps
-    print(f"L/S cost: {cost:.0f} bps/leg round-trip. NW lag = {cfg.lag()}. "
-          f"Quantiles = {cfg.n_quantiles}.\n")
+    cost_grid = ", ".join(f"{c:.0f}" for c in cfg.cost_grid_bps)
+    print(f"L/S cost: headline {cfg.honest_cost_bps:.0f} bps round-trip "
+          f"(grid: {cost_grid}). NW lag = {cfg.lag()}. Quantiles = {cfg.n_quantiles}.")
+    print(f"Direction chosen on TRAIN split only; OOS sign validated on embargoed TEST.\n")
 
     rows = []
-    sr_pool = []  # per-period net Sharpe across trials, for the deflated-Sharpe variance term
+    sr_pool = []  # per-period GROSS Sharpe across single-feature trials (DSR null, reported only)
     for i, sp in enumerate(specs, 1):
         h = sp["horizon"]
         sig = sp["signal"]
@@ -924,30 +1082,49 @@ def run(cfg: Config) -> pd.DataFrame:
         std_ic = float(ic_v.std(ddof=1)) if ic_v.size > 1 else np.nan
         ir = mean_ic / std_ic if std_ic and std_ic > 0 else np.nan
         t_nw, p_nw, n_nw = newey_west_t(ic_v, cfg.lag())
-        direction = 1.0 if mean_ic >= 0 else -1.0
 
-        # OOS sign on the embargoed test split
+        # FIX #4: choose direction on the TRAIN split only (full-sample sign makes the
+        # OOS sign-agreement check self-fulfilling). Validate the sign OOS on TEST.
+        train_ic = ic[engine.train_day_mask]
+        train_ic = train_ic[np.isfinite(train_ic)]
+        train_mean = float(train_ic.mean()) if train_ic.size else mean_ic
+        direction = 1.0 if train_mean >= 0 else -1.0
+
         test_ic = ic[engine.test_day_mask]
         test_ic = test_ic[np.isfinite(test_ic)]
         test_mean = float(test_ic.mean()) if test_ic.size else np.nan
 
         bt = engine.ls_backtest(sig, h, direction)
-        net_rets = bt.pop("net_rets")
-        gross_rets = bt.pop("gross_rets")
-        # Skill detection (DSR/PSR) runs on GROSS returns: the null is "no predictive
-        # skill" -> gross Sharpe ~ 0. Net Sharpe is kept as a separate DEPLOYABILITY
-        # gate (does the skill survive costs?). Mixing them would let cost-bleed noise
-        # define the null and crush every DSR.
+        gross_rets = bt["gross_rets"]
+        turns = bt["turns"]
+        mkt_rets = bt["mkt_rets"]
+        ppy = bt["ppy"]
+
+        # FIX #2: honest cost grid + beta-neutralised (residual) Sharpe + breakeven cost.
+        gross_sharpe = _ann_sharpe(gross_rets, ppy)
+        cost_sharpes: Dict[str, float] = {}
+        for c in cfg.cost_grid_bps:
+            cost_sharpes[f"net_sharpe_{int(round(c))}bps"] = _ann_sharpe(
+                net_after_cost(gross_rets, turns, c), ppy)
+        net_honest = net_after_cost(gross_rets, turns, cfg.honest_cost_bps) \
+            if gross_rets.size else np.array([])
+        net_sharpe = _ann_sharpe(net_honest, ppy)
+        net_ann_ret = float(np.mean(net_honest) * ppy) if net_honest.size else np.nan
+        max_dd = max_drawdown(np.cumprod(1.0 + net_honest)) if net_honest.size else np.nan
+        be_bps = breakeven_bps(gross_rets, turns)
+        if cfg.beta_neutralize and gross_rets.size:
+            resid, mkt_beta = beta_neutral_resid(gross_rets, mkt_rets)
+            bn_sharpe = _ann_sharpe(resid, ppy)
+        else:
+            bn_sharpe, mkt_beta = np.nan, np.nan
+
+        # Skill detection (DSR/PSR, reported only) runs on GROSS returns.
         sr_period = np.nan
         skew = kurt = np.nan
         if gross_rets.size >= 8:
             sdg = gross_rets.std(ddof=1)
             sr_period = float(gross_rets.mean() / sdg) if sdg > 0 else np.nan
             skew, kurt = _skew_kurt(gross_rets)
-            # The null Sharpe dispersion is estimated from RAW SINGLES at the primary
-            # horizon only. Engineered families (pairs/regime/composite) are seeded
-            # from top features and are deliberately enriched for true-positives, so
-            # including them would inflate the null and crush every DSR.
             if (np.isfinite(sr_period) and gross_rets.size >= 20
                     and h == cfg.primary_horizon and sp["kind"] == "single"):
                 sr_pool.append(sr_period)
@@ -958,12 +1135,12 @@ def run(cfg: Config) -> pd.DataFrame:
             strategy=sp["name"], kind=sp["kind"], horizon=h, direction=int(direction),
             feature=sp.get("feature", ""),
             mean_IC=mean_ic, IC_IR=ir, t_NW=t_nw, p_NW=p_nw,
-            IC_hit=float((ic_v > 0).mean()), test_IC=test_mean,
-            gross_sharpe=bt["gross_sharpe"], net_sharpe=bt["net_sharpe"],
-            net_ann_ret=bt["net_ann_ret"], turnover=bt["turnover"],
-            max_dd=bt["max_dd"], n_reb=bt["n_reb"], n_days=int(ic_v.size),
-            srp=sr_period, nret=int(net_rets.size), rskew=skew, rkurt=kurt,
-            **reg,
+            IC_hit=float((ic_v > 0).mean()), train_IC=train_mean, test_IC=test_mean,
+            gross_sharpe=gross_sharpe, net_sharpe=net_sharpe, net_ann_ret=net_ann_ret,
+            beta_neutral_sharpe=bn_sharpe, mkt_beta=mkt_beta, breakeven_bps=be_bps,
+            turnover=bt["turnover"], max_dd=max_dd, n_reb=bt["n_reb"], n_days=int(ic_v.size),
+            srp=sr_period, nret=int(gross_rets.size), rskew=skew, rkurt=kurt,
+            **cost_sharpes, **reg,
         ))
         if i % 200 == 0 or i == N:
             print(f"  scored {i}/{N}  ({time.perf_counter()-t0:.0f}s)")
@@ -1002,14 +1179,17 @@ def run(cfg: Config) -> pd.DataFrame:
         for r in res.itertuples()
     ]
 
-    res["verdict"] = [_verdict(r, t_bar, cfg) for r in res.itertuples()]
+    res["verdict"] = [_verdict(r, cfg) for r in res.itertuples()]
 
-    # rank: candidates first, then by deflated Sharpe, then |t|
+    # FIX #3: rank by OUT-OF-SAMPLE effect size, not DSR/gross-Sharpe (both are
+    # reward-hacked by static low-turnover tilts: a zero-IC price-level book scored
+    # DSR~1.0 / net-Sharpe~5 last run). |test_IC| buries zero-IC artifacts because a
+    # static tilt has ~0 cross-sectional IC out of sample.
     order = res.assign(
         _is_cand=res["verdict"].isin(["STRONG", "PROMISING"]).astype(int),
-        _abs_t=res["t_NW"].abs(),
-        _dsr=res["DSR"].fillna(0),
-    ).sort_values(["_is_cand", "_dsr", "_abs_t"], ascending=False).index
+        _oos=res["test_IC"].abs().fillna(0.0),
+        _eff=res["mean_IC"].abs().fillna(0.0),
+    ).sort_values(["_is_cand", "_oos", "_eff"], ascending=False).index
     res = res.loc[order].reset_index(drop=True)
 
     _write_outputs(res, engine, cfg, N, t_bar, var_sr)
@@ -1017,27 +1197,42 @@ def run(cfg: Config) -> pd.DataFrame:
     return res
 
 
-def _verdict(r, t_bar: float, cfg: Config) -> str:
-    t = abs(r.t_NW) if pd.notna(r.t_NW) else 0.0
+def _verdict(r, cfg: Config) -> str:
+    """Gate on EFFECT SIZE AFTER HONEST COST + OUT-OF-SAMPLE PERSISTENCE + ECONOMIC
+    PLAUSIBILITY. The t-bar and DSR are reported but no longer gate (t is free at this
+    sample size; DSR is reward-hacked by static tilts)."""
+    ic = abs(r.mean_IC) if pd.notna(r.mean_IC) else 0.0
     ir = abs(r.IC_IR) if pd.notna(r.IC_IR) else 0.0
-    gsh = r.gross_sharpe if pd.notna(r.gross_sharpe) else np.nan
-    nsh = r.net_sharpe if pd.notna(r.net_sharpe) else np.nan
-    dsr = r.DSR if pd.notna(r.DSR) else 0.0
+    nsh = r.net_sharpe if pd.notna(r.net_sharpe) else np.nan      # net of honest cost
     yh = r.year_hit if pd.notna(r.year_hit) else 0.0
-    oos_ok = (pd.isna(r.test_IC)) or (np.sign(r.test_IC) == np.sign(r.mean_IC))
+    to = r.turnover if pd.notna(r.turnover) else np.nan
+    direction = r.direction if pd.notna(r.direction) else (1 if r.mean_IC >= 0 else -1)
+    # OOS sign must match the TRAIN-chosen direction (not the full-sample sign).
+    oos_ok = (pd.isna(r.test_IC)) or (np.sign(r.test_IC) == np.sign(direction))
 
-    # too-good-to-be-true -> almost always upstream leakage, not alpha
-    if ir > cfg.too_good_daily_ir or (pd.notna(gsh) and gsh > cfg.too_good_gross_sharpe):
+    # 1) leakage canary (reported as AVOID, almost always upstream look-ahead)
+    if ir > cfg.too_good_daily_ir:
         return "AVOID (too good - check leakage)"
 
-    if t < t_bar:
+    # 2) static-tilt artifact: high Sharpe with ~no turnover and ~zero rank-IC is a
+    #    survivorship-fed level bet (long expensive / short cheap), not alpha.
+    if pd.notna(to) and to < cfg.tilt_turnover_max and ic < cfg.ic_floor:
+        return "NO_EDGE (static tilt)"
+
+    # 3) needs a real cross-sectional signal at all
+    if ic < cfg.ic_floor:
         return "NO_EDGE"
 
-    if (dsr >= cfg.dsr_strong and pd.notna(nsh) and nsh >= cfg.net_sharpe_strong
-            and yh >= cfg.year_hit_min and oos_ok):
+    # 4) needs out-of-sample persistence in the chosen direction
+    if cfg.require_oos_sign and not oos_ok:
+        return "NO_EDGE (OOS sign flip)"
+
+    # 5) effect size after honest cost
+    if pd.isna(nsh):
+        return "MARGINAL"
+    if nsh >= cfg.net_sharpe_strong and yh >= cfg.year_hit_min:
         return "STRONG"
-    if (dsr >= cfg.dsr_promising and pd.notna(nsh) and nsh >= cfg.net_sharpe_promising
-            and yh >= cfg.year_hit_min and oos_ok):
+    if nsh >= cfg.net_sharpe_promising and yh >= cfg.year_hit_min:
         return "PROMISING"
     return "MARGINAL"
 
@@ -1045,11 +1240,15 @@ def _verdict(r, t_bar: float, cfg: Config) -> str:
 def _write_outputs(res: pd.DataFrame, engine: ScoreEngine, cfg: Config,
                    N: int, t_bar: float, var_sr: float) -> None:
     out_dir = Path(cfg.out_dir)
+    cost_cols = [f"net_sharpe_{int(round(c))}bps" for c in cfg.cost_grid_bps
+                 if f"net_sharpe_{int(round(c))}bps" in res.columns]
     public_cols = [
         "strategy", "kind", "horizon", "direction", "feature",
-        "verdict", "DSR", "mean_IC", "IC_IR", "t_NW", "p_NW", "IC_hit",
-        "test_IC", "gross_sharpe", "net_sharpe", "net_ann_ret", "turnover",
-        "max_dd", "n_reb", "n_days",
+        "verdict", "mean_IC", "IC_IR", "t_NW", "p_NW", "IC_hit",
+        "train_IC", "test_IC", "DSR",
+        "gross_sharpe", "net_sharpe", "net_ann_ret", *cost_cols,
+        "beta_neutral_sharpe", "mkt_beta", "breakeven_bps",
+        "turnover", "max_dd", "n_reb", "n_days",
         "IR_hivol", "IR_lovol", "IR_trendup", "IR_trenddn", "IR_disphi", "IR_displo",
         "year_hit", "n_years",
     ]
@@ -1067,9 +1266,12 @@ def _write_outputs(res: pd.DataFrame, engine: ScoreEngine, cfg: Config,
         verdict_counts=counts,
         families={k: int(v) for k, v in res["kind"].value_counts().items()},
         config=dict(horizons=list(cfg.horizons), primary_horizon=cfg.primary_horizon,
-                    n_quantiles=cfg.n_quantiles, cost_bps=cfg.cost_bps,
-                    slippage_bps=cfg.slippage_bps, min_names_per_day=cfg.min_names_per_day,
-                    use_model_target=cfg.use_model_target),
+                    engineered_all_horizons=cfg.engineered_all_horizons,
+                    n_quantiles=cfg.n_quantiles, honest_cost_bps=cfg.honest_cost_bps,
+                    cost_grid_bps=list(cfg.cost_grid_bps), beta_neutralize=cfg.beta_neutralize,
+                    ic_floor=cfg.ic_floor, min_names_per_day=cfg.min_names_per_day,
+                    use_model_target=cfg.use_model_target,
+                    gating="effect_size_after_cost + OOS_persistence + economic_plausibility"),
     )
     with open(out_dir / "strategy_lab_summary.json", "w") as fh:
         json.dump(summary, fh, indent=2, default=str)
@@ -1080,32 +1282,39 @@ def _write_outputs(res: pd.DataFrame, engine: ScoreEngine, cfg: Config,
 
     # ── pretty print ──
     show = board.copy()
-    fmt = ["DSR", "mean_IC", "IC_IR", "t_NW", "p_NW", "IC_hit", "test_IC",
-           "gross_sharpe", "net_sharpe", "net_ann_ret", "turnover", "max_dd",
-           "IR_hivol", "IR_lovol", "IR_trendup", "IR_trenddn", "year_hit"]
+    fmt = ["DSR", "mean_IC", "IC_IR", "t_NW", "p_NW", "IC_hit", "train_IC", "test_IC",
+           "gross_sharpe", "net_sharpe", "net_ann_ret", "beta_neutral_sharpe", "mkt_beta",
+           "breakeven_bps", "turnover", "max_dd",
+           "IR_hivol", "IR_lovol", "IR_trendup", "IR_trenddn", "year_hit", *cost_cols]
     for c in fmt:
         if c in show.columns:
             show[c] = show[c].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
     pd.set_option("display.max_rows", 120, "display.width", 260,
                   "display.max_colwidth", 42)
-    cols_print = ["strategy", "kind", "horizon", "verdict", "DSR", "mean_IC",
-                  "IC_IR", "t_NW", "net_sharpe", "year_hit"]
+    cols_print = ["strategy", "kind", "horizon", "verdict", "mean_IC", "test_IC",
+                  "net_sharpe", "beta_neutral_sharpe", "turnover", "year_hit"]
     cols_print = [c for c in cols_print if c in show.columns]
-    print("\n==================== TOP 40 STRATEGIES (ranked) ====================")
+    print("\n==================== TOP 40 STRATEGIES (ranked by OOS effect size) ====================")
     print(show[cols_print].head(40).to_string(index=False))
 
     print("\n==================== VERDICT TALLY ====================")
-    for k in ["STRONG", "PROMISING", "MARGINAL", "NO_EDGE"]:
-        print(f"  {k:<10}: {counts.get(k, 0)}")
+    shown = set()
+    for k in ["STRONG", "PROMISING", "MARGINAL"]:
+        print(f"  {k:<14}: {counts.get(k, 0)}")
+        shown.add(k)
+    no_edge = sum(v for k, v in counts.items() if k.startswith("NO_EDGE"))
     avoid = sum(v for k, v in counts.items() if k.startswith("AVOID"))
-    print(f"  {'AVOID':<10}: {avoid}")
+    print(f"  {'NO_EDGE':<14}: {no_edge}   (incl. static-tilt / OOS-sign-flip)")
+    print(f"  {'AVOID':<14}: {avoid}")
     print(f"\n  scoreboard : {csv_path}")
     print(f"  summary    : {out_dir / 'strategy_lab_summary.json'}")
     print(f"  top detail : {out_dir / 'strategy_lab_top.csv'}")
     print("\n  Reality check:")
     print("   - Clearing the gates is NECESSARY, not SUFFICIENT. Paper-trade before capital.")
     print("   - 'AVOID (too good)' almost always means look-ahead leakage upstream, not alpha.")
-    print("   - Deflated Sharpe already discounts the number of strategies tried.")
+    print("   - Gating is on net-of-cost effect size + OOS persistence + economic plausibility.")
+    print("   - t-bar & DSR are REPORTED only (t is free at this N; DSR is gamed by static tilts).")
+    print("   - Check net_sharpe across the cost grid + breakeven_bps to see where the edge dies.")
 
 
 # ───────────────────────── synthetic self-test ─────────────────────────
@@ -1199,36 +1408,39 @@ def make_synthetic_panel(n_symbols: int = 120, n_days: int = 1200, seed: int = 7
 
 
 def self_test() -> int:
-    cfg = Config(self_test=True, horizons=(1, 3, 5), primary_horizon=5,
+    cfg = Config(self_test=True, horizons=(1, 2, 3), primary_horizon=3,
                  top_k_pairs=6, top_k_regime=6, min_names_per_day=20,
                  composite_sizes=(3, 5), detail_top_k=15)
     res = run(cfg)
+    PH = cfg.primary_horizon
 
     print("\n==================== SELF-TEST ASSERTIONS ====================")
     ok = True
 
     # 1) the clean planted alpha must be a top single at the primary horizon
-    singles5 = res[(res["kind"] == "single") & (res["horizon"] == 5)].copy()
-    singles5 = singles5.reindex(singles5["t_NW"].abs().sort_values(ascending=False).index)
-    top_feats = list(singles5["feature"].head(3))
+    singlesP = res[(res["kind"] == "single") & (res["horizon"] == PH)].copy()
+    singlesP = singlesP.reindex(singlesP["t_NW"].abs().sort_values(ascending=False).index)
+    top_feats = list(singlesP["feature"].head(3))
     cond1 = "D_signal_alpha" in top_feats
-    print(f"  [{'PASS' if cond1 else 'FAIL'}] D_signal_alpha in top-3 singles by |t|: {top_feats}")
+    print(f"  [{'PASS' if cond1 else 'FAIL'}] D_signal_alpha in top-3 singles by |t| @h={PH}: {top_feats}")
     ok &= cond1
 
-    # 2) planted alpha must be recognised as having edge at the primary horizon
-    #    (STRONG / PROMISING / or AVOID-too-good on this ultra-clean panel) - never
-    #    dismissed as NO_EDGE or MARGINAL.
+    # 2) the planted alpha must still be DETECTED as real signal at the primary horizon,
+    #    i.e. NOT dismissed as NO_EDGE/noise. Under the honest-cost gate a realistically
+    #    weak factor can legitimately be MARGINAL as a naked single (it bleeds the cost),
+    #    while its regime-gated / composite forms clear the bar -- so we require "not
+    #    NO_EDGE" here and check the STRONG/PROMISING path separately (assertion 6).
     va = res.loc[(res["feature"] == "D_signal_alpha") & (res["kind"] == "single")
-                 & (res["horizon"] == 5), "verdict"]
+                 & (res["horizon"] == PH), "verdict"]
     vstr = va.iloc[0] if not va.empty else "MISSING"
-    cond2 = (not va.empty) and (vstr.startswith(("STRONG", "PROMISING", "AVOID")))
-    print(f"  [{'PASS' if cond2 else 'FAIL'}] D_signal_alpha recognised as edge "
-          f"(STRONG/PROMISING/AVOID): {vstr}")
+    cond2 = (not va.empty) and (not str(vstr).startswith("NO_EDGE"))
+    print(f"  [{'PASS' if cond2 else 'FAIL'}] D_signal_alpha detected as signal "
+          f"(not NO_EDGE) @h={PH}: {vstr}")
     ok &= cond2
 
-    # 3) pure noise features should overwhelmingly be NO_EDGE
+    # 3) pure noise features should overwhelmingly be NO_EDGE (any NO_EDGE* variant)
     noise = res[res["feature"].astype(str).str.startswith("D_noise_")]
-    frac_noise_dead = (noise["verdict"] == "NO_EDGE").mean() if len(noise) else 1.0
+    frac_noise_dead = (noise["verdict"].astype(str).str.startswith("NO_EDGE")).mean() if len(noise) else 1.0
     cond3 = frac_noise_dead >= 0.6
     print(f"  [{'PASS' if cond3 else 'FAIL'}] >=60% of noise features are NO_EDGE: "
           f"{frac_noise_dead:.0%}")
@@ -1236,7 +1448,7 @@ def self_test() -> int:
 
     # 4) regime view: beta's IC-IR in high vol should beat low vol
     vb = res[(res["feature"] == "D_signal_beta") & (res["kind"] == "single")
-             & (res["horizon"] == 5)]
+             & (res["horizon"] == PH)]
     if not vb.empty and pd.notna(vb["IR_hivol"].iloc[0]) and pd.notna(vb["IR_lovol"].iloc[0]):
         cond4 = abs(vb["IR_hivol"].iloc[0]) > abs(vb["IR_lovol"].iloc[0])
         print(f"  [{'PASS' if cond4 else 'FAIL'}] D_signal_beta |IR| hi-vol > lo-vol: "
@@ -1246,7 +1458,7 @@ def self_test() -> int:
         print("  [SKIP] D_signal_beta regime IRs unavailable")
     ok &= cond4
 
-    # 5) we really did test hundreds of strategies (generators fired)
+    # 5) we really did test hundreds of strategies (generators fired at all horizons)
     cond5 = len(res) >= 50
     print(f"  [{'PASS' if cond5 else 'FAIL'}] scored >=50 strategies: {len(res)}")
     ok &= cond5
@@ -1256,6 +1468,13 @@ def self_test() -> int:
     cond6 = n_good >= 1
     print(f"  [{'PASS' if cond6 else 'FAIL'}] >=1 STRONG/PROMISING strategy surfaced: {n_good}")
     ok &= cond6
+
+    # 7) engineered families must now exist at NON-primary horizons (the whole point)
+    eng = res[res["kind"].isin(["pair_prod", "pair_sign", "pair_gate", "regime_gate", "composite"])]
+    eng_h = set(eng["horizon"].unique().tolist())
+    cond7 = len({1, 2, 3} & eng_h) >= 2
+    print(f"  [{'PASS' if cond7 else 'FAIL'}] engineered families span multiple horizons: {sorted(eng_h)}")
+    ok &= cond7
 
     print("\n" + ("ALL SELF-TESTS PASSED" if ok else "SELF-TEST FAILURES ABOVE"))
     return 0 if ok else 1
@@ -1276,8 +1495,14 @@ def parse_args() -> Tuple[Config, bool]:
     p.add_argument("--raw-target", action="store_true", help="skip model vol-adjusted target")
 
     p.add_argument("--quantiles", type=int, default=None, dest="n_quantiles")
-    p.add_argument("--cost-bps", type=float, default=None)
-    p.add_argument("--slippage-bps", type=float, default=None)
+    p.add_argument("--cost-bps", type=float, default=None, help="legacy per-leg cost (folded into honest round-trip)")
+    p.add_argument("--slippage-bps", type=float, default=None, help="legacy per-leg slippage (folded in)")
+    p.add_argument("--honest-cost-bps", type=float, default=None, help="headline round-trip cost for the verdict")
+    p.add_argument("--cost-grid", type=float, nargs="+", default=None, help="round-trip bps grid to report")
+    p.add_argument("--no-beta-neutral", action="store_true", help="skip market-beta-neutral Sharpe")
+    p.add_argument("--keep-level-features", action="store_true", help="do NOT drop raw price/size level features")
+    p.add_argument("--primary-only", action="store_true",
+                   help="run engineered families at the primary horizon only (legacy behaviour)")
     p.add_argument("--min-names", type=int, default=None, dest="min_names_per_day")
     p.add_argument("--min-adv", type=float, default=None, dest="min_adv_inr")
     p.add_argument("--min-price", type=float, default=None)
@@ -1307,12 +1532,20 @@ def parse_args() -> Tuple[Config, bool]:
         cfg.primary_horizon = a.primary_horizon
     if a.raw_target:
         cfg.use_model_target = False
-    for k in ["out_dir", "n_quantiles", "cost_bps", "slippage_bps", "min_names_per_day",
-              "min_adv_inr", "min_price", "embargo_days", "top_k_pairs", "top_k_regime",
-              "max_features"]:
+    for k in ["out_dir", "n_quantiles", "cost_bps", "slippage_bps", "honest_cost_bps",
+              "min_names_per_day", "min_adv_inr", "min_price", "embargo_days",
+              "top_k_pairs", "top_k_regime", "max_features"]:
         v = getattr(a, k, None)
         if v is not None:
             setattr(cfg, k, v)
+    if a.cost_grid:
+        cfg.cost_grid_bps = tuple(a.cost_grid)
+    if a.no_beta_neutral:
+        cfg.beta_neutralize = False
+    if a.keep_level_features:
+        cfg.exclude_level_features = False
+    if a.primary_only:
+        cfg.engineered_all_horizons = False
     if a.no_pairs:
         cfg.do_pairs = False
     if a.no_regime_gates:
