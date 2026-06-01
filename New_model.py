@@ -2312,6 +2312,57 @@ def compare_architectures_oos(panel: pd.DataFrame, feats: List[str], ev_target: 
     return report
 
 
+# ===================== Full-panel scoring (multi-day diagnostics) =====================
+
+def export_full_panel_scores(panel: pd.DataFrame,
+                             regime_router: 'RegimeRouter',
+                             feats_schema: List[str],
+                             impute_stats: Dict[str, float],
+                             batch_rows: int = 200_000) -> Optional[str]:
+    """Score EVERY (symbol, day) row with the regime-routed model and write a
+    slim panel_scored.parquet: [symbol, timestamp, stock_regime, prob_5d_mean,
+    close]. This is what MULTI-DAY diagnostics consume (e.g. model_character.py),
+    instead of the single latest cross-section in watchlist_5d_signal.csv.
+
+    Scored in row batches so it does not OOM on a multi-million-row panel.
+
+    NOTE: rows inside the training window are scored IN-SAMPLE, so use this to
+    characterise the model's behaviour/tilt (momentum vs mean-reversion) across
+    history — not to measure out-of-sample edge. Filter to the embargoed TEST
+    window downstream if you need a strictly leak-free read.
+    """
+    if PANEL_OUT is None or panel is None or len(panel) == 0:
+        return None
+    out_path = Path(PANEL_OUT).with_name("panel_scored.parquet")
+    has_regime = "stock_regime" in panel.columns
+    keep = [c for c in ["symbol", "timestamp", "close"] if c in panel.columns]
+    n = len(panel)
+    parts = []
+    t0 = time.perf_counter()
+    for start in range(0, n, int(batch_rows)):
+        sl = panel.iloc[start:start + int(batch_rows)]
+        Xb = reindex_and_impute(
+            sanitize_feature_matrix(sl.reindex(columns=feats_schema).copy()),
+            feats_schema, impute_stats).reset_index(drop=True)
+        rv = (sl["stock_regime"].reset_index(drop=True)
+              if has_regime else pd.Series(["bull_trend"] * len(sl)))
+        prob = regime_router.predict_proba_by_regime(Xb, rv)
+        out = sl[keep].reset_index(drop=True).copy()
+        out["stock_regime"] = rv.values if has_regime else "bull_trend"
+        out["prob_5d_mean"] = np.asarray(prob, dtype=float)
+        parts.append(out)
+    scored = pd.concat(parts, ignore_index=True)
+    try:
+        scored.to_parquet(out_path, index=False, compression="snappy")
+    except Exception:
+        out_path = out_path.with_suffix(".csv")
+        scored.to_csv(out_path, index=False)
+    print(f"[PanelScore] Full-panel scores ({len(scored):,} rows, "
+          f"{scored['timestamp'].nunique()} days) -> {out_path} "
+          f"in {time.perf_counter()-t0:.1f}s")
+    return str(out_path)
+
+
 # ===================== TODAY-BASED nightly watchlist =====================
 
 def nightly_watchlist(panel: pd.DataFrame, feats: List[str],
@@ -2358,6 +2409,15 @@ def nightly_watchlist(panel: pd.DataFrame, feats: List[str],
     print(f"[Watchlist] Universe before scoring: {len(last):,} rows")
 
     feats_schema, impute_stats = load_schema(FEATURES_SCHEMA_PATH)
+
+    # Score the FULL panel (every symbol, every day) so multi-day diagnostics
+    # (model_character.py) measure behaviour across history, not just today's
+    # single cross-section. Wrapped so it can never break the watchlist build.
+    try:
+        export_full_panel_scores(panel, regime_router, feats_schema, impute_stats)
+    except Exception as _e:
+        print(f"[PanelScore] full-panel score export skipped: {_e}")
+
     # AUDIT-FIX 4: use reindex so a feature missing from the panel does not
     # raise KeyError. reindex_and_impute below will fill via train-only medians.
     X_raw = sanitize_feature_matrix(last.reindex(columns=feats_schema).copy())
