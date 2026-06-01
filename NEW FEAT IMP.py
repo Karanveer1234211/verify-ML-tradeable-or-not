@@ -51,6 +51,11 @@ OUTPUT FILES (written to OUT_DIR)
   harmful_features.csv                   <- features that hurt the model
   regime_specialist_features.csv         <- 1-2 regime signal, dead in others
   feature_family_summary.csv             <- which families are alive?
+  feature_category_map.csv               <- NEW: per-feature STRATEGY category
+                                             (breakout/mean_reversion/momentum/...)
+                                             + gain/IC/perm-AUC-drop/recommendation
+  feature_category_summary.csv           <- NEW: per-category rollup so you can
+                                             pick the right features for a NEW model
   feature_importance_global.csv
   feature_ic_by_year.csv
   regime_ic_summary.csv
@@ -70,7 +75,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import time
 import warnings
+import zlib
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -81,6 +89,8 @@ from joblib import load
 from scipy.stats import spearmanr
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
+
+warnings.filterwarnings("ignore")
 
 warnings.filterwarnings("ignore")
 
@@ -146,6 +156,79 @@ def family_of(name: str) -> str:
         if name.startswith(prefix):
             return label
     return "other"
+
+
+# =============================================================================
+# STRATEGY CATEGORIES (semantic) — distinct from the prefix FAMILY above.
+#
+# family_of() tells you the NAMESPACE (D_/W_/WQ_/...). The categories below tell
+# you the STRATEGY the feature speaks to (breakout, mean-reversion, momentum,
+# ...), so that when you build a NEW model you can pull the right features.
+#
+# A feature can carry MULTIPLE tags (e.g. D_bb_bw_20 is both a volatility and a
+# breakout-setup feature). `categorize()` returns (primary, [all tags]). The
+# category report aggregates by EVERY tag, so the "breakout" view shows every
+# breakout-relevant feature even if its primary label is something else.
+#
+# Rules are (tag, regex) evaluated against the lowercased feature name. Order =
+# priority for the PRIMARY tag. Edit freely — it's just a lookup.
+# =============================================================================
+
+CATEGORY_RULES: List[Tuple[str, str]] = [
+    ("breakout",        r"breakout|donch|dist_from_20h|dist_from_52wh|days_since_bo|"
+                        r"\bnr\b|nr_length|nr_day|nr_expand|compress_state|bb_bw"),
+    ("mean_reversion",  r"rsi|bb_pctb|pctb|_oli\b|cmf|zscore|_z252|dvol_z|vol_z|williams|stoch"),
+    ("momentum_trend",  r"ema|sma|macd|adx|pdi|mdi|_trend|stack|angle|roll_slope|slope_stability|"
+                        r"midpoint_slope|ret_4w|ret_13w|golden|\bmom\b|roc|obv_slope"),
+    ("volatility",      r"atr|vol_yz|range_pct|range_to_atr|ret_5d_roll_std|high_vol|yang|garman|bb_bw"),
+    ("volume_liquidity",r"obv|dollar_vol|vol_surge|avg20_vol|\bvolume\b|vol_vs|dvol|cmf"),
+    ("candle_structure",r"body_ratio|wick|hh_run|hl_run|lh_run|ll_run|\bhh\b|\bhl\b|\blh\b|\bll\b|"
+                        r"inside_day|gap_pct|day_type|\boli\b|range\b"),
+    ("cpr_pivot",       r"^cpr_|_cpr|cpr_|pivot|support|resistance|tmr_cpr"),
+    ("vwap_value",      r"vpoc|vwap|wq_41\b"),
+    ("regime_context",  r"^regime_|x_regime|stock_regime|dispersion|^golden|daily_trend|weekly_trend|monthly_trend"),
+    ("macro",           r"^m_"),
+    ("calendar",        r"^dow_|_dow\b|daytype|dayofweek"),
+    ("worldquant",      r"^wq_|^d_wq_|_wq_"),
+    ("interaction",     r"^comb_|^x_"),
+]
+_COMPILED_RULES = [(tag, re.compile(rx)) for tag, rx in CATEGORY_RULES]
+
+
+def categorize(name: str) -> Tuple[str, List[str]]:
+    """Return (primary_category, [all matching tags]) for a feature name.
+
+    Primary = first rule that matches (priority order above). Tags = every rule
+    that matches, so multi-purpose features surface under each relevant strategy.
+    """
+    low = name.lower()
+    tags = [tag for tag, rx in _COMPILED_RULES if rx.search(low)]
+    if not tags:
+        return ("other", ["other"])
+    return (tags[0], tags)
+
+
+# =============================================================================
+# Model introspection for fast, EXACT permutation (used by _PermEngine)
+# =============================================================================
+
+def _booster_used_features(model, feature_cols: List[str]) -> Optional[set]:
+    """Set of features the model's LightGBM booster actually splits on (split>0).
+
+    Permuting a feature the booster never splits on cannot change its score, so
+    such features get an EXACT auc_drop of 0 with no scoring. Returns None if no
+    booster can be recovered (caller then conservatively assumes all features).
+    """
+    b = get_lgb_booster(model)
+    if b is None:
+        return None
+    try:
+        names = b.feature_name()
+        split = b.feature_importance(importance_type="split")
+        used = {n for n, s in zip(names, split) if s > 0}
+        return used & set(feature_cols)
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -234,6 +317,146 @@ def permute_auc_multi(model, X: pd.DataFrame, y: np.ndarray, feature: str,
     if len(drops) == 0:
         return np.nan, np.nan
     return float(drops.mean()), float(drops.std(ddof=0))
+
+
+def _feat_seed(feature: str, salt: int = 0) -> int:
+    """Deterministic per-feature seed (reproducible across runs, unlike hash())."""
+    return 42 + (zlib.crc32((str(salt) + "::" + feature).encode("utf-8")) % 9999)
+
+
+class _PermEngine:
+    """Fast, NUMERICALLY-EXACT multi-shuffle permutation importance.
+
+    It reproduces the original scoring EXACTLY (whole-model predict_proba for
+    models that expose it, else the mean of `members` — same as the original
+    `unwrap_to_score`), and only applies optimizations that cannot change the
+    result:
+
+      1. SKIP UNUSED: a feature no booster splits on cannot change the score, so
+         its auc_drop is exactly (0.0, 0.0) with no scoring.
+      2. MEMBER CACHING: for an ensemble, permuting feature f only changes the
+         members whose booster uses f. We cache base member predictions and
+         re-score ONLY affected members per shuffle. Enabled only when we have
+         VERIFIED that the model's own predict_proba equals the mean of its
+         members on a probe batch (so the cached recombination is identical);
+         otherwise we fall back to whole-model re-scoring.
+      3. IN-PLACE COLUMN WRITE: permute the single column on the frame and
+         restore it, instead of copying the whole 137-col frame per feature
+         (the original did X.copy() every feature). The model still receives a
+         DataFrame, so name-based projection in the wrappers keeps working.
+
+    Seeds are deterministic (crc32) so runs are reproducible — the original used
+    Python's hash(), which is salted per process and already non-reproducible.
+    """
+
+    def __init__(self, model, feature_cols: List[str], X_probe: Optional[pd.DataFrame] = None):
+        self.model = model
+        self.feature_cols = list(feature_cols)
+        self.members = list(getattr(model, "members", None) or [])
+        self.has_pp = hasattr(model, "predict_proba")
+        # used-feature sets
+        if self.members:
+            self._member_used = [_booster_used_features(m, self.feature_cols) for m in self.members]
+        else:
+            self._member_used = [_booster_used_features(model, self.feature_cols)]
+        self.union_used = self._union(self._member_used)
+        # scoring mode
+        self.use_member_cache = False
+        if self.members:
+            if not self.has_pp:
+                self.use_member_cache = True            # mirrors unwrap: mean of members
+            elif X_probe is not None and len(X_probe) > 0:
+                try:
+                    whole = self.model.predict_proba(X_probe)[:, 1]
+                    meanm = np.mean([m.predict_proba(X_probe)[:, 1] for m in self.members], axis=0)
+                    if np.nanmax(np.abs(whole - meanm)) < 1e-9:
+                        self.use_member_cache = True    # safe: predict_proba == mean(members)
+                except Exception:
+                    self.use_member_cache = False
+        self._mp: Optional[List[np.ndarray]] = None     # cached base member probs
+
+    @staticmethod
+    def _union(used_sets) -> Optional[set]:
+        u = set()
+        for s in used_sets:
+            if s is None:
+                return None                              # opaque -> assume uses everything
+            u |= s
+        return u
+
+    def _score_whole(self, X: pd.DataFrame) -> np.ndarray:
+        if self.has_pp:
+            return self.model.predict_proba(X)[:, 1]
+        return np.mean([m.predict_proba(X)[:, 1] for m in self.members], axis=0)
+
+    def base_probs(self, X: pd.DataFrame) -> np.ndarray:
+        if self.use_member_cache:
+            self._mp = [m.predict_proba(X)[:, 1] for m in self.members]
+            return np.mean(self._mp, axis=0)
+        return self._score_whole(X)
+
+    def perm_drop(self, X: pd.DataFrame, y: np.ndarray, feature: str,
+                  base_auc: float, n_shuffles: int, seed: int) -> Tuple[float, float]:
+        # (1) exact skip
+        if self.union_used is not None and feature not in self.union_used:
+            return 0.0, 0.0
+        affected = [i for i, u in enumerate(self._member_used) if (u is None or feature in u)] \
+            if self.use_member_cache else None
+        if self.use_member_cache and self._mp is None:
+            # lazy base member probs on the (unpermuted) frame; cached for reuse
+            self._mp = [m.predict_proba(X)[:, 1] for m in self.members]
+        col_orig = X[feature].to_numpy().copy()
+        rng = np.random.default_rng(seed)
+        drops = []
+        try:
+            for _ in range(n_shuffles):
+                perm = col_orig.copy()
+                rng.shuffle(perm)
+                X[feature] = perm                        # in-place single column (no frame copy)
+                if self.use_member_cache:
+                    probs = list(self._mp)
+                    for i in affected:
+                        probs[i] = self.members[i].predict_proba(X)[:, 1]
+                    score = probs[0] if len(probs) == 1 else np.mean(probs, axis=0)
+                else:
+                    score = self._score_whole(X)
+                try:
+                    drops.append(base_auc - roc_auc_score(y, score))
+                except Exception:
+                    drops.append(np.nan)
+        finally:
+            X[feature] = col_orig                        # always restore
+        drops = np.array([d for d in drops if not np.isnan(d)])
+        if len(drops) == 0:
+            return np.nan, np.nan
+        return float(drops.mean()), float(drops.std(ddof=0))
+
+
+def spearman_ic_block(Xvals: np.ndarray, colnames: List[str], target: np.ndarray) -> Dict[str, float]:
+    """Vectorized Spearman IC of EVERY column of Xvals vs target.
+
+    Equivalent to scipy.spearmanr(col, target, nan_policy='omit') per column
+    (Pearson on average ranks), computed for all columns in one matrix op.
+    Assumes Xvals has no NaN (features are imputed); drops rows where target is
+    NaN (the same row set for every column, matching nan_policy='omit' here).
+    """
+    out = {c: np.nan for c in colnames}
+    if Xvals.size == 0:
+        return out
+    ok = ~np.isnan(target)
+    if ok.sum() < 2:
+        return out
+    Xv = Xvals[ok]
+    t = target[ok]
+    tr = pd.Series(t).rank().to_numpy()                  # average ranks (matches scipy ties)
+    Xr = pd.DataFrame(Xv).rank(axis=0).to_numpy()
+    tc = tr - tr.mean()
+    Xc = Xr - Xr.mean(axis=0)
+    num = Xc.T @ tc
+    den = np.sqrt((Xc ** 2).sum(axis=0) * (tc ** 2).sum())
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ic = np.where(den > 0, num / den, np.nan)
+    return dict(zip(colnames, ic))
 
 
 # =============================================================================
@@ -549,18 +772,17 @@ def main(base_dir: Path):
     years_te = labeled_te["year"].values
 
     ic_year_rows = []
-    for feat in tqdm(FEATURES, desc="  global IC by year"):
-        x = X_full[feat].values
-        for yr in sorted(set(years_te)):
-            m = years_te == yr
-            if m.sum() < 100:
-                continue
-            try:
-                ic, _ = spearmanr(x[test_mask][m], ret_5d_te[m], nan_policy="omit")
-                if not np.isnan(ic):
-                    ic_year_rows.append({"feature": feat, "year": int(yr), "ic": ic})
-            except Exception:
-                pass
+    # Vectorized: one matrix op per year for ALL features (== per-feature spearmanr).
+    Xte_vals = X_te[FEATURES].to_numpy(dtype=float)
+    for yr in sorted(set(years_te)):
+        m = years_te == yr
+        if m.sum() < 100:
+            continue
+        ic_map = spearman_ic_block(Xte_vals[m], FEATURES, ret_5d_te[m])
+        for feat in FEATURES:
+            ic = ic_map[feat]
+            if ic is not None and not np.isnan(ic):
+                ic_year_rows.append({"feature": feat, "year": int(yr), "ic": ic})
     ic_year_df = pd.DataFrame(ic_year_rows)
     if not ic_year_df.empty:
         ic_year_pivot = ic_year_df.pivot(index="feature", columns="year", values="ic")
@@ -595,20 +817,17 @@ def main(base_dir: Path):
         })
     ic_summary = pd.DataFrame(ic_summary_rows).set_index("feature")
 
-    # Per-regime IC on test slice
+    # Per-regime IC on test slice (vectorized: one matrix op per regime)
     regime_ic_df = pd.DataFrame(index=FEATURES, columns=[f"ic_{r}" for r in REGIMES])
     if "stock_regime" in labeled_te.columns:
-        for feat in tqdm(FEATURES, desc="  per-regime IC"):
-            x = X_te[feat].values
-            for r in REGIMES:
-                m = (labeled_te["stock_regime"].values == r)
-                if m.sum() < 1000:
-                    continue
-                try:
-                    ic, _ = spearmanr(x[m], ret_5d_te[m], nan_policy="omit")
-                    regime_ic_df.loc[feat, f"ic_{r}"] = ic if not np.isnan(ic) else np.nan
-                except Exception:
-                    pass
+        reg_vals = labeled_te["stock_regime"].values
+        for r in REGIMES:
+            m = (reg_vals == r)
+            if m.sum() < 1000:
+                continue
+            ic_map = spearman_ic_block(Xte_vals[m], FEATURES, ret_5d_te[m])
+            for feat in FEATURES:
+                regime_ic_df.loc[feat, f"ic_{r}"] = ic_map[feat]
     regime_ic_df = regime_ic_df.astype(float)
     regime_ic_df.to_csv(out_dir / "regime_ic_summary.csv")
 
@@ -700,24 +919,17 @@ def main(base_dir: Path):
     print(f"\n[6/9] PERMUTATION IMPORTANCE ({PERM_SHUFFLES} shuffles per feature)...")
 
     global_perm_rows = []
-    score_fn_global = unwrap_to_score(fallback_model) or (lambda X: clf_diag.predict_proba(X)[:, 1])
-    p_base_global = score_fn_global(X_te)
-    base_auc_global = roc_auc_score(y_te, p_base_global)
+    model_global = fallback_model if unwrap_to_score(fallback_model) is not None else clf_diag
+    eng_g = _PermEngine(model_global, FEATURES, X_probe=X_te)
+    base_auc_global = roc_auc_score(y_te, eng_g.base_probs(X_te))
     print(f"[6/9] Global base AUC (prod model on OOT test): {base_auc_global:.4f}")
-
-    # Use a tiny model wrapper so permute_auc_multi can call .predict_proba
-    class _Wrap:
-        def __init__(self, fn):
-            self.fn = fn
-        def predict_proba(self, X):
-            p = self.fn(X)
-            return np.column_stack([1 - p, p])
-
-    wrapped_global = _Wrap(score_fn_global)
+    if eng_g.union_used is not None:
+        print(f"[6/9] Model splits on {len(eng_g.union_used)}/{len(FEATURES)} features; "
+              f"the rest get an EXACT 0-drop without scoring."
+              + ("  [member-caching ON]" if eng_g.use_member_cache else ""))
     for feat in tqdm(FEATURES, desc="  global perm"):
-        m, s = permute_auc_multi(wrapped_global, X_te, y_te, feat,
-                                 base_auc=base_auc_global,
-                                 n_shuffles=PERM_SHUFFLES, seed=42 + hash(feat) % 9999)
+        m, s = eng_g.perm_drop(X_te, y_te, feat, base_auc=base_auc_global,
+                               n_shuffles=PERM_SHUFFLES, seed=_feat_seed(feat))
         global_perm_rows.append({
             "feature": feat,
             "auc_drop_global_mean": m,
@@ -746,19 +958,17 @@ def main(base_dir: Path):
             score_r = unwrap_to_score(model_r)
             if score_r is None:
                 continue
+            eng_r = _PermEngine(model_r, FEATURES, X_probe=X_r_te)
             try:
-                base_auc_r = roc_auc_score(y_r_te, score_r(X_r_te))
+                base_auc_r = roc_auc_score(y_r_te, eng_r.base_probs(X_r_te))
             except Exception as e:
                 print(f"[6/9] {r}: baseline AUC failed ({e}), skipping")
                 continue
             regime_aucs[r] = base_auc_r
             print(f"[6/9] {r}: n_test={n_r:,}  base_AUC={base_auc_r:.4f}")
-            wrapped_r = _Wrap(score_r)
             for feat in tqdm(FEATURES, desc=f"  perm {r}"):
-                m_, s_ = permute_auc_multi(wrapped_r, X_r_te, y_r_te, feat,
-                                           base_auc=base_auc_r,
-                                           n_shuffles=PERM_SHUFFLES,
-                                           seed=42 + hash((r, feat)) % 9999)
+                m_, s_ = eng_r.perm_drop(X_r_te, y_r_te, feat, base_auc=base_auc_r,
+                                         n_shuffles=PERM_SHUFFLES, seed=_feat_seed(feat, salt=r))
                 regime_perm[r][feat] = (m_, s_)
 
     # Build per-regime perm DataFrame
@@ -919,6 +1129,11 @@ def main(base_dir: Path):
     rec["recommendation"] = rec.apply(recommend, axis=1)
     rec["reason"] = rec.apply(explain, axis=1)
 
+    # NEW: strategy-category tags (breakout / mean_reversion / momentum_trend / ...)
+    _cat = {f: categorize(f) for f in rec["feature"]}
+    rec["primary_category"] = rec["feature"].map(lambda f: _cat[f][0])
+    rec["category_tags"] = rec["feature"].map(lambda f: "|".join(_cat[f][1]))
+
     order = {"DROP_HARMFUL": 0, "DROP": 1, "REVIEW": 2, "KEEP": 3}
     rec["sort_order"] = rec["recommendation"].map(order)
     rec = rec.sort_values(["sort_order", "gain_rank"]).drop(columns=["sort_order"])
@@ -927,7 +1142,7 @@ def main(base_dir: Path):
     round_cols = [c for c in rec.columns if c not in {"feature", "family", "recommendation", "reason",
                                                        "regime_specialist", "is_dead_everywhere",
                                                        "is_harmful_anywhere", "best_regime",
-                                                       "generalizes"}]
+                                                       "generalizes", "primary_category", "category_tags"}]
     for c in round_cols:
         if c in rec.columns:
             rec[c] = pd.to_numeric(rec[c], errors="coerce").round(5)
@@ -940,6 +1155,74 @@ def main(base_dir: Path):
 
     specialists = rec[rec["regime_specialist"] == True].copy()
     specialists.to_csv(out_dir / "regime_specialist_features.csv", index=False)
+
+    # =========================================================================
+    # STRATEGY-CATEGORY REPORT (NEW)
+    # "Which features serve which strategy, and how strong are they?" — so when
+    # you build a NEW model (breakout, mean-reversion, momentum, ...) you know
+    # exactly which features to pull and how much edge each carries.
+    # =========================================================================
+    print("\n[Cat] Strategy-category report...")
+    cat_tags = {f: categorize(f)[1] for f in FEATURES}
+    cat_primary = {f: categorize(f)[0] for f in FEATURES}
+
+    # Per-feature map (one row per feature, with its category + all metrics)
+    g_by_feat = global_imp.set_index("feature")
+    cat_map = pd.DataFrame({"feature": FEATURES})
+    cat_map["primary_category"] = cat_map["feature"].map(cat_primary)
+    cat_map["category_tags"] = cat_map["feature"].map(lambda f: "|".join(cat_tags[f]))
+    cat_map["family"] = cat_map["feature"].map(family_of)
+    cat_map["gain_pct"] = cat_map["feature"].map(g_by_feat["gain_pct"].to_dict())
+    cat_map["split_pct"] = cat_map["feature"].map(g_by_feat["split_pct"].to_dict())
+    cat_map["gain_rank"] = cat_map["feature"].map(g_by_feat["gain_rank"].to_dict())
+    cat_map["mean_abs_ic"] = cat_map["feature"].map(ic_summary["mean_abs_ic"].to_dict())
+    cat_map["auc_drop_global"] = cat_map["feature"].map(global_perm_df["auc_drop_global_mean"].to_dict())
+    for r in REGIMES:
+        cat_map[f"auc_drop_{r}"] = cat_map["feature"].map(regime_perm_df[f"auc_drop_{r}"].to_dict())
+        cat_map[f"ic_{r}"] = cat_map["feature"].map(regime_ic_df[f"ic_{r}"].to_dict())
+    cat_map["best_regime"] = cat_map["feature"].map(
+        consistency_df.set_index("feature")["best_regime"].to_dict())
+    cat_map["recommendation"] = cat_map["feature"].map(
+        rec.set_index("feature")["recommendation"].to_dict())
+    cat_map = cat_map.sort_values(["primary_category", "gain_pct"],
+                                  ascending=[True, False]).reset_index(drop=True)
+    cat_map.to_csv(out_dir / "feature_category_map.csv", index=False)
+
+    # Category SUMMARY: a feature contributes to EVERY tag it carries, so the
+    # "breakout" row lists every breakout-relevant feature even if its primary
+    # label is volatility/momentum.
+    rec_by_feat = rec.set_index("feature")["recommendation"]
+    all_tags = sorted({t for f in FEATURES for t in cat_tags[f]})
+    summ_rows = []
+    for tag in all_tags:
+        members = [f for f in FEATURES if tag in cat_tags[f]]
+        if not members:
+            continue
+        gp = g_by_feat.reindex(members)["gain_pct"]
+        pdrop = global_perm_df.reindex(members)["auc_drop_global_mean"]
+        ic = ic_summary.reindex(members)["mean_abs_ic"]
+        recs = rec_by_feat.reindex(members)
+        top = gp.sort_values(ascending=False).head(6).index.tolist()
+        summ_rows.append({
+            "category": tag,
+            "n_features": len(members),
+            "n_keep": int((recs == "KEEP").sum()),
+            "n_review": int((recs == "REVIEW").sum()),
+            "n_drop": int(recs.isin(["DROP", "DROP_HARMFUL"]).sum()),
+            "total_gain_pct": round(float(gp.sum()), 2),
+            "mean_gain_pct": round(float(gp.mean()), 4),
+            "mean_perm_drop": round(float(pdrop.mean()), 5),
+            "max_perm_drop": round(float(pdrop.max()), 5),
+            "mean_abs_ic": round(float(ic.mean()), 4),
+            "max_abs_ic": round(float(ic.max()), 4),
+            "top_features": ", ".join(top),
+        })
+    cat_summary = pd.DataFrame(summ_rows).sort_values("total_gain_pct", ascending=False).reset_index(drop=True)
+    cat_summary.to_csv(out_dir / "feature_category_summary.csv", index=False)
+    print(cat_summary[["category", "n_features", "n_keep", "total_gain_pct",
+                       "mean_abs_ic", "max_perm_drop", "top_features"]].to_string(index=False))
+    print(f"[Cat] Wrote feature_category_map.csv + feature_category_summary.csv "
+          f"({len(all_tags)} categories).")
 
     # =========================================================================
     # regime_features.json — direct hand-off to production
@@ -1024,6 +1307,8 @@ def main(base_dir: Path):
         consistency_df.to_excel(w, sheet_name="10_Consistency", index=False)
         harmful.to_excel(w, sheet_name="11_Harmful", index=False)
         specialists.to_excel(w, sheet_name="12_Specialists", index=False)
+        cat_summary.to_excel(w, sheet_name="13_CategorySummary", index=False)
+        cat_map.to_excel(w, sheet_name="14_CategoryMap", index=False)
 
     # =========================================================================
     # Summary
@@ -1053,6 +1338,114 @@ def main(base_dir: Path):
 
 
 # =============================================================================
+# Self-test: prove the fast path is NUMERICALLY IDENTICAL to the original
+# =============================================================================
+
+def _self_test() -> int:
+    print("=" * 70)
+    print("NEW FEAT IMP — SELF-TEST (numeric equivalence + categories)")
+    print("=" * 70)
+    from lightgbm import LGBMClassifier
+    rng = np.random.default_rng(0)
+    n, k = 4000, 12
+    cols = [f"D_f{i:02d}" for i in range(k)]
+    X = pd.DataFrame(rng.normal(size=(n, k)), columns=cols)
+    # member 1 uses f00..f03, member 2 uses f06..f09; f04,f05,f10,f11 are noise
+    sig1 = X[cols[0]] + 0.7 * X[cols[2]] - 0.5 * X[cols[3]]
+    sig2 = 0.9 * X[cols[6]] - 0.6 * X[cols[8]] + 0.4 * X[cols[9]]
+    y = ((sig1 + sig2 + rng.normal(scale=0.5, size=n)) > 0).astype(int).values
+
+    def _fit(feat_subset):
+        m = LGBMClassifier(n_estimators=60, num_leaves=15, min_data_in_leaf=50,
+                           random_state=1, verbosity=-1)
+        Xz = X.copy()
+        # zero out non-subset columns so the booster only splits on the subset
+        for c in cols:
+            if c not in feat_subset:
+                Xz[c] = 0.0
+        m.fit(Xz, y)
+        return m
+
+    m1 = _fit(cols[0:4])
+    m2 = _fit(cols[6:10])
+
+    class _MeanEnsemble:
+        def __init__(self, members):
+            self.members = members
+        def predict_proba(self, Xin):
+            return np.mean([mm.predict_proba(Xin) for mm in self.members], axis=0)
+
+    ens = _MeanEnsemble([m1, m2])
+
+    # Reference scorer == original code path (whole-model predict_proba)
+    class _Wrap:
+        def __init__(self, fn):
+            self.fn = fn
+        def predict_proba(self, Xin):
+            p = self.fn(Xin)
+            return np.column_stack([1 - p, p])
+    ref_wrap = _Wrap(unwrap_to_score(ens))
+
+    base = ens.predict_proba(X)[:, 1]
+    base_auc = roc_auc_score(y, base)
+    eng = _PermEngine(ens, cols, X_probe=X)
+    print(f"[test] member-caching enabled: {eng.use_member_cache} "
+          f"(should be True); model splits on {len(eng.union_used)}/{k} features")
+
+    max_diff = 0.0
+    n_skipped_exact = 0
+    for f in cols:
+        seed = _feat_seed(f)
+        ref_m, ref_s = permute_auc_multi(ref_wrap, X, y, f, base_auc=base_auc,
+                                         n_shuffles=5, seed=seed)
+        eng_m, eng_s = eng.perm_drop(X, y, f, base_auc=base_auc, n_shuffles=5, seed=seed)
+        d = abs(ref_m - eng_m) + abs(ref_s - eng_s)
+        max_diff = max(max_diff, d)
+        if eng.union_used is not None and f not in eng.union_used:
+            n_skipped_exact += 1
+            assert abs(ref_m) < 1e-9, f"{f}: reference drop for an unused feature should be ~0, got {ref_m}"
+    print(f"[test] permutation max |fast - reference| over {k} features = {max_diff:.3e}")
+    assert max_diff < 1e-9, "fast permutation diverged from the reference!"
+    print(f"[test] features skipped via exact-0 (unused): {n_skipped_exact}")
+
+    # Vectorized IC == scipy spearmanr
+    target = rng.normal(size=n)
+    target[rng.random(n) < 0.1] = np.nan       # some NaN targets (omit path)
+    ic_fast = spearman_ic_block(X.to_numpy(dtype=float), cols, target)
+    okm = ~np.isnan(target)
+    ic_max_diff = 0.0
+    for j, c in enumerate(cols):
+        ref_ic, _ = spearmanr(X[c].to_numpy()[okm], target[okm])
+        ic_max_diff = max(ic_max_diff, abs(ref_ic - ic_fast[c]))
+    print(f"[test] vectorized IC max |fast - scipy| = {ic_max_diff:.3e}")
+    assert ic_max_diff < 1e-9, "vectorized IC diverged from scipy spearmanr!"
+
+    # Category mapping sanity
+    checks = {
+        "D_breakout_high_20": "breakout",
+        "D_donch_pos_20": "breakout",
+        "D_rsi14": "mean_reversion",
+        "D_bb_pctB_20": "mean_reversion",
+        "D_ema20_angle_deg": "momentum_trend",
+        "D_atr14": "volatility",
+        "D_obv_slope": "momentum_trend",
+        "D_cpr_bc": "cpr_pivot",
+        "M_nifty_ret": "macro",
+        "DOW_1": "calendar",
+    }
+    for feat, want in checks.items():
+        prim, tags = categorize(feat)
+        assert want in tags, f"categorize({feat}) -> {tags}, expected to contain '{want}'"
+    # breakout-relevant features all carry the 'breakout' tag
+    for feat in ["D_breakout_high_50", "D_dist_from_52wh", "D_nr_expand", "D_compress_state"]:
+        assert "breakout" in categorize(feat)[1], f"{feat} missing breakout tag"
+    print("[test] category mapping: OK")
+
+    print("\nALL SELF-TESTS PASSED")
+    return 0
+
+
+# =============================================================================
 # Entry point
 # =============================================================================
 
@@ -1060,5 +1453,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-dir", type=str, default=str(DEFAULT_BASE_DIR),
                         help="Directory containing panel_cache.parquet, features_train.json, models/")
+    parser.add_argument("--self-test", action="store_true",
+                        help="Validate fast-path numeric equivalence + categories on synthetic data; no real data needed")
     args = parser.parse_args()
+    if args.self_test:
+        raise SystemExit(_self_test())
     main(Path(args.base_dir))
