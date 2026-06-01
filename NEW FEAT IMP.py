@@ -86,6 +86,11 @@ defaults reproduce the original 5d run byte-for-byte.
 Flags: --horizon H | --quantiles Q (top/bottom = 1/Q) | --embargo D (default H+1)
        --raw-target | --target-col COL | --ret-col COL | --model-path P | --model-free
        --out-dir DIR (default <base>/feature_diagnostics[_<H>d])
+       --cluster-prune [--cluster-corr 0.85]  group collinear features, keep one
+            representative per cluster, demote the rest to REDUNDANT (permutation
+            importance is unreliable on collinear twins). Off by default.
+       --std-gate [--std-gate-k 1.0]  gate KEEP/DROP on perm-drop significance
+            (mean > k*shuffle_std) instead of the bare absolute PERM_DROP_KEEP.
 
 Model-anchored vs model-free: gain% and permutation AUC-drop require a model and
 are only meaningful for a model you actually built; the IC / regime-IC / category
@@ -201,6 +206,22 @@ class Config:
     test_frac: float = TEST_FRAC
     out_dir: Optional[Path] = None          # default = <base>/feature_diagnostics[_<H>d]
 
+    # cluster-aware pruning (opt-in; default OFF preserves the legacy per-feature
+    # output byte-for-byte). Permutation importance is unreliable on collinear
+    # features (a twin masks the drop), so naive per-feature pruning can delete a
+    # real signal merely because it is duplicated. When ON, features are grouped at
+    # |spearman| >= cluster_corr; only the best representative per cluster (by perm
+    # drop, then |IC|) stays KEEP/REVIEW, the rest are demoted to REDUNDANT (recorded,
+    # never silently lost). Features that are KEEP on strong standalone evidence are
+    # protected and never demoted.
+    cluster_prune: bool = False
+    cluster_corr: float = CORR_THRESHOLD    # correlation threshold for a cluster (0.85)
+    # std-gated KEEP/DROP: gate on perm-drop SIGNIFICANCE (drop_mean > k*drop_std)
+    # rather than the bare absolute PERM_DROP_KEEP=0.0010, which the docstring itself
+    # notes sits within the 5-shuffle noise band. Uses the std already computed.
+    std_gate: bool = False
+    std_gate_k: float = 1.0                 # significance multiple on the shuffle std
+
     def embargo(self) -> int:
         return int(self.embargo_days) if self.embargo_days is not None else int(self.horizon) + 1
 
@@ -241,6 +262,45 @@ def ensure_forward_return(panel: pd.DataFrame, ret_col: str, horizon: int) -> No
         close = pd.to_numeric(panel["close"], errors="coerce")
         fwd = (g_close.shift(-horizon) / close - 1.0) * 100.0
     panel[ret_col] = fwd.replace([np.inf, -np.inf], np.nan).to_numpy()
+
+
+def correlation_clusters(corr_mat: pd.DataFrame, threshold: float) -> Dict[str, int]:
+    """Group features into clusters via single-linkage on |spearman| >= threshold
+    (connected components of the thresholded correlation graph). No scipy needed.
+
+    Returns {feature: cluster_id}. A feature absent from corr_mat is treated by the
+    caller as its own singleton cluster."""
+    feats = list(corr_mat.columns)
+    n = len(feats)
+    idx = {f: i for i, f in enumerate(feats)}
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    A = corr_mat.to_numpy()
+    iu, ju = np.triu_indices(n, k=1)
+    m = np.abs(A[iu, ju]) >= threshold
+    for i, j in zip(iu[m], ju[m]):
+        union(int(i), int(j))
+
+    roots = [find(i) for i in range(n)]
+    remap: Dict[int, int] = {}
+    out: Dict[str, int] = {}
+    for f in feats:
+        r = roots[idx[f]]
+        if r not in remap:
+            remap[r] = len(remap)
+        out[f] = remap[r]
+    return out
 
 
 FEATURE_FAMILIES = [
@@ -1218,18 +1278,30 @@ def main(cfg: Config):
         regime_ics = [v for v in regime_ics if pd.notna(v)]
         global_perm = row.get("auc_drop_global_mean") or 0.0
         mean_abs_ic = row.get("mean_abs_ic") or 0.0
+        # std-gate: require the global perm drop to clear k * (its shuffle std), not
+        # just the bare absolute PERM_DROP_KEEP (which sits inside the noise band).
+        # perm_keep_eff is the effective "useful" bar; perm_dead is the "no real
+        # signal" bar used by the DROP test.
+        perm_keep_eff = PERM_DROP_KEEP * 3
+        perm_dead = PERM_DROP_KEEP
+        if cfg.std_gate:
+            gstd = row.get("auc_drop_global_std")
+            if pd.notna(gstd) and gstd > 0:
+                sig = cfg.std_gate_k * float(gstd)
+                perm_keep_eff = max(perm_keep_eff, sig)
+                perm_dead = max(perm_dead, sig)
         # KEEP signals
         if regime_drops and max(regime_drops) >= REGIME_EXCEPTIONAL:
             return "KEEP"
         if regime_ics and max(regime_ics) >= IC_THRESHOLD * 2:
             return "KEEP"
-        if global_perm >= PERM_DROP_KEEP * 3:
+        if global_perm >= perm_keep_eff:
             return "KEEP"
         if mean_abs_ic >= IC_THRESHOLD * 2:
             return "KEEP"
         # DROP signals
         dead_all_regimes = bool(regime_drops) and all(d < PERM_DROP_KEEP for d in regime_drops)
-        dead_global = global_perm < PERM_DROP_KEEP
+        dead_global = global_perm < perm_dead
         weak_ic = mean_abs_ic < IC_THRESHOLD
         if dead_all_regimes and dead_global and weak_ic:
             return "DROP"
@@ -1267,20 +1339,92 @@ def main(cfg: Config):
     rec["recommendation"] = rec.apply(recommend, axis=1)
     rec["reason"] = rec.apply(explain, axis=1)
 
+    # =====================================================================
+    # CLUSTER-AWARE PRUNING (opt-in: cfg.cluster_prune)
+    # Permutation importance is unreliable on collinear features (a twin masks the
+    # drop), so per-feature pruning can delete a real signal merely because it is
+    # duplicated. Group features at |spearman| >= cfg.cluster_corr; within each
+    # multi-member cluster keep ONE representative (best by global perm drop, then
+    # |IC|) and DEMOTE the rest to REDUNDANT (recorded, never silently lost). If the
+    # representative was itself marked DROP only on a low perm drop but still has
+    # non-trivial standalone |IC|, that DROP is the masking artifact -> rescue it to
+    # REVIEW so the cluster's signal is never lost.
+    # =====================================================================
+    rec["cluster_id"] = -1
+    rec["cluster_role"] = ""
+    if cfg.cluster_prune:
+        clust_feats = [f for f in rec["feature"] if f in corr_mat.columns]
+        cmap = correlation_clusters(corr_mat.loc[clust_feats, clust_feats], cfg.cluster_corr) \
+            if clust_feats else {}
+        # features absent from corr_mat -> their own singleton ids
+        next_id = (max(cmap.values()) + 1) if cmap else 0
+        for f in rec["feature"]:
+            if f not in cmap:
+                cmap[f] = next_id
+                next_id += 1
+        rec["cluster_id"] = rec["feature"].map(cmap).astype(int)
+
+        gp = rec.set_index("feature")["auc_drop_global_mean"].to_dict()
+        ic = rec.set_index("feature")["mean_abs_ic"].to_dict()
+        recm = rec.set_index("feature")["recommendation"].to_dict()
+        new_rec = dict(recm)
+        roles: Dict[str, str] = {f: "" for f in rec["feature"]}
+        demoted = 0
+        rescued = 0
+        for cid, grp in rec.groupby("cluster_id"):
+            members = list(grp["feature"])
+            if len(members) < 2:
+                continue
+            # representative = best by (perm drop, then |IC|)
+            members_sorted = sorted(
+                members,
+                key=lambda f: (gp.get(f, 0.0) if pd.notna(gp.get(f)) else 0.0,
+                               ic.get(f, 0.0) if pd.notna(ic.get(f)) else 0.0),
+                reverse=True,
+            )
+            rep = members_sorted[0]
+            roles[rep] = f"representative(n={len(members)})"
+            # RESCUE: a representative that recommend() marked DROP purely on a low
+            # permutation drop is the classic collinearity victim (its twin carried
+            # the signal during permutation). If it still has non-trivial standalone
+            # IC, the DROP is a masking artifact -> rescue to REVIEW. A genuinely dead
+            # cluster (weak IC too) is left DROP.
+            if recm.get(rep) == "DROP" and pd.notna(ic.get(rep)) and abs(ic.get(rep, 0.0)) >= IC_THRESHOLD:
+                new_rec[rep] = "REVIEW"
+                roles[rep] = f"representative(n={len(members)}; rescued from perm-mask)"
+                rescued += 1
+            # the rest of the cluster carries the same signal -> REDUNDANT (recorded,
+            # not lost). Harmful features keep their harmful flag (more important).
+            for f in members_sorted[1:]:
+                if recm.get(f) == "DROP_HARMFUL":
+                    roles[f] = "harmful"
+                    continue
+                new_rec[f] = "REDUNDANT"
+                roles[f] = f"redundant->({rep})"
+                demoted += 1
+        rec["recommendation"] = rec["feature"].map(new_rec)
+        rec["cluster_role"] = rec["feature"].map(roles)
+        n_clusters = rec["cluster_id"].nunique()
+        n_multi = int((rec.groupby("cluster_id")["feature"].transform("size") > 1).sum())
+        print(f"[9/9] Cluster-aware pruning: {n_clusters} clusters "
+              f"(|r|>={cfg.cluster_corr}); {n_multi} features in multi-member clusters; "
+              f"{demoted} demoted to REDUNDANT; {rescued} representative(s) rescued from perm-mask.")
+
     # NEW: strategy-category tags (breakout / mean_reversion / momentum_trend / ...)
     _cat = {f: categorize(f) for f in rec["feature"]}
     rec["primary_category"] = rec["feature"].map(lambda f: _cat[f][0])
     rec["category_tags"] = rec["feature"].map(lambda f: "|".join(_cat[f][1]))
 
-    order = {"DROP_HARMFUL": 0, "DROP": 1, "REVIEW": 2, "KEEP": 3}
-    rec["sort_order"] = rec["recommendation"].map(order)
+    order = {"DROP_HARMFUL": 0, "DROP": 1, "REDUNDANT": 2, "REVIEW": 3, "KEEP": 4}
+    rec["sort_order"] = rec["recommendation"].map(order).fillna(3)
     rec = rec.sort_values(["sort_order", "gain_rank"]).drop(columns=["sort_order"])
 
     # Round
     round_cols = [c for c in rec.columns if c not in {"feature", "family", "recommendation", "reason",
                                                        "regime_specialist", "is_dead_everywhere",
                                                        "is_harmful_anywhere", "best_regime",
-                                                       "generalizes", "primary_category", "category_tags"}]
+                                                       "generalizes", "primary_category", "category_tags",
+                                                       "cluster_role"}]
     for c in round_cols:
         if c in rec.columns:
             rec[c] = pd.to_numeric(rec[c], errors="coerce").round(5)
@@ -1346,7 +1490,7 @@ def main(cfg: Config):
             "n_features": len(members),
             "n_keep": int((recs == "KEEP").sum()),
             "n_review": int((recs == "REVIEW").sum()),
-            "n_drop": int(recs.isin(["DROP", "DROP_HARMFUL"]).sum()),
+            "n_drop": int(recs.isin(["DROP", "DROP_HARMFUL", "REDUNDANT"]).sum()),
             "total_gain_pct": round(float(gp.sum()), 2),
             "mean_gain_pct": round(float(gp.mean()), 4),
             "mean_perm_drop": round(float(pdrop.mean()), 5),
@@ -1367,7 +1511,7 @@ def main(cfg: Config):
     # =========================================================================
     print("\n[Out] Writing regime_features.json...")
     keep_global = rec[rec["recommendation"].isin(["KEEP", "REVIEW"])]["feature"].tolist()
-    drop_features = rec[rec["recommendation"].isin(["DROP", "DROP_HARMFUL"])]["feature"].tolist()
+    drop_features = rec[rec["recommendation"].isin(["DROP", "DROP_HARMFUL", "REDUNDANT"])]["feature"].tolist()
 
     regime_specific: Dict[str, List[str]] = {}
     for r in REGIMES:
@@ -1456,7 +1600,7 @@ def main(cfg: Config):
     print("=" * 70)
     counts = rec["recommendation"].value_counts()
     print(f"\nFeatures total: {len(FEATURES)}")
-    for k in ["KEEP", "REVIEW", "DROP", "DROP_HARMFUL"]:
+    for k in ["KEEP", "REVIEW", "REDUNDANT", "DROP", "DROP_HARMFUL"]:
         n = int(counts.get(k, 0))
         pct = 100 * n / len(FEATURES)
         print(f"  {k:<14} {n:>4d}  ({pct:5.1f}%)")
@@ -1600,6 +1744,35 @@ def _self_test() -> int:
     assert "ret_2d_oc_pct" in pf.columns and pf["ret_2d_oc_pct"].notna().sum() >= 5
     print("[test] Config derivation + forward-return fallback: OK")
 
+    # correlation_clusters: single-linkage connected components at threshold
+    cm = pd.DataFrame(
+        [[1.00, 0.95, 0.10, 0.05],
+         [0.95, 1.00, 0.08, 0.02],
+         [0.10, 0.08, 1.00, 0.91],
+         [0.05, 0.02, 0.91, 1.00]],
+        index=["f0", "f1", "f2", "f3"], columns=["f0", "f1", "f2", "f3"])
+    cl = correlation_clusters(cm, threshold=0.85)
+    assert cl["f0"] == cl["f1"], "f0/f1 (r=0.95) should cluster together"
+    assert cl["f2"] == cl["f3"], "f2/f3 (r=0.91) should cluster together"
+    assert cl["f0"] != cl["f2"], "the two pairs should be distinct clusters"
+    # transitive chain f0~f1~f2 via single-linkage even if f0,f2 below threshold
+    cm2 = pd.DataFrame(
+        [[1.00, 0.90, 0.50],
+         [0.90, 1.00, 0.88],
+         [0.50, 0.88, 1.00]],
+        index=["a", "b", "c"], columns=["a", "b", "c"])
+    cl2 = correlation_clusters(cm2, threshold=0.85)
+    assert cl2["a"] == cl2["b"] == cl2["c"], "single-linkage should chain a-b-c"
+    # all-independent -> all singletons
+    cm3 = pd.DataFrame(np.eye(3), index=["x", "y", "z"], columns=["x", "y", "z"])
+    assert len(set(correlation_clusters(cm3, 0.85).values())) == 3
+    print("[test] correlation_clusters (linkage + chaining + singletons): OK")
+
+    # cluster-prune config wiring
+    cc = Config(cluster_prune=True, cluster_corr=0.9, std_gate=True, std_gate_k=1.5)
+    assert cc.cluster_prune and cc.cluster_corr == 0.9 and cc.std_gate and cc.std_gate_k == 1.5
+    print("[test] cluster-prune / std-gate config: OK")
+
     print("\nALL SELF-TESTS PASSED")
     return 0
 
@@ -1631,6 +1804,16 @@ if __name__ == "__main__":
                              "(scout mode for a horizon you have not trained yet)")
     parser.add_argument("--out-dir", type=str, default=None,
                         help="output directory (default <base>/feature_diagnostics[_<H>d])")
+    parser.add_argument("--cluster-prune", action="store_true",
+                        help="cluster collinear features (|spearman| >= --cluster-corr) and keep "
+                             "one representative per cluster; demote the rest to REDUNDANT")
+    parser.add_argument("--cluster-corr", type=float, default=None,
+                        help="correlation threshold for a cluster (default 0.85)")
+    parser.add_argument("--std-gate", action="store_true",
+                        help="gate KEEP/DROP on perm-drop significance (mean > k*std) instead of "
+                             "the bare absolute threshold")
+    parser.add_argument("--std-gate-k", type=float, default=None,
+                        help="significance multiple on the shuffle std (default 1.0)")
     parser.add_argument("--self-test", action="store_true",
                         help="Validate fast-path numeric equivalence + categories on synthetic data; no real data needed")
     args = parser.parse_args()
@@ -1648,5 +1831,9 @@ if __name__ == "__main__":
         model_path=Path(args.model_path) if args.model_path else None,
         model_free=args.model_free,
         out_dir=Path(args.out_dir) if args.out_dir else None,
+        cluster_prune=args.cluster_prune,
+        cluster_corr=args.cluster_corr if args.cluster_corr is not None else CORR_THRESHOLD,
+        std_gate=args.std_gate,
+        std_gate_k=args.std_gate_k if args.std_gate_k is not None else 1.0,
     )
     main(cfg)
