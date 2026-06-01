@@ -280,6 +280,30 @@ def classify(mean_corr: float) -> str:
     return "STRONGLY MOMENTUM"
 
 
+def horizon_sweep(panel: pd.DataFrame, date_col: str, sym_col: str,
+                  predictors: List[str], horizons: List[int], min_names: int) -> pd.DataFrame:
+    """corr(recent-strength predictor, forward return @ each horizon H).
+
+    Returns a (predictor x horizon) table of cross-sectional rank correlations.
+    Reading: strongly negative at short H that rises toward 0/positive at longer
+    H is the classic short-term-reversal signature — it tells you the holding
+    period the reversion edge actually supports.
+    """
+    out: Dict[int, Dict[str, float]] = {}
+    for h in horizons:
+        p = compute_forward_target(panel, sym_col, date_col, horizon=int(h))
+        col: Dict[str, float] = {}
+        for sig in predictors:
+            if sig not in p.columns:
+                continue
+            corr, _, _ = xs_spearman(p, date_col, sig, "_fwd_target", min_names)
+            col[sig] = corr
+        out[int(h)] = col
+    piv = pd.DataFrame(out)
+    piv.columns = [f"{h}d" for h in piv.columns]
+    return piv
+
+
 def _run_target_check(a) -> int:
     """PANEL-ONLY: is the opportunity (the model's target) mean-reverting?"""
     panel = _load_any(Path(a.panel))
@@ -312,6 +336,26 @@ def _run_target_check(a) -> int:
     print(f"  rows={len(panel):,}  symbols={panel[sym_col].nunique()}  "
           f"dates={panel[date_col].nunique()}  horizon={a.horizon}d  regime='{regime_col}'")
     print(f"  recent-strength signals: {signals}")
+
+    if a.by_horizon:
+        horizons = [int(x) for x in str(a.horizons).split(",") if x.strip()]
+        predictors = [c for c in trailing if c in panel.columns] or signals[:3]
+        sweep = horizon_sweep(panel, date_col, sym_col, predictors, horizons, a.min_names)
+        print(f"\n=========== HORIZON SWEEP: corr(recent return, forward@H)  [<0 = reversion] ===========")
+        with pd.option_context("display.width", 200, "display.max_columns", 30,
+                               "display.float_format", lambda x: f"{x:+.3f}"):
+            print(sweep.to_string())
+        meanrow = sweep.mean(axis=0)
+        print("  MEAN over predictors: " + "  ".join(f"{h}={v:+.3f}" for h, v in meanrow.items()))
+        if len(meanrow):
+            best_h = meanrow.idxmin()
+            last_h = meanrow.index[-1]
+            print(f"  -> strongest reversion at {best_h} (corr {meanrow.min():+.3f}); "
+                  f"by {last_h} corr={meanrow.loc[last_h]:+.3f}. Negative-shrinking-to-zero "
+                  f"across H is the short-term-reversal signature; the holding period where "
+                  f"corr is most negative is where the edge is strongest.")
+        sweep.to_csv(Path(a.out_dir) / "model_character_horizon_sweep.csv")
+        print(f"  written: {Path(a.out_dir) / 'model_character_horizon_sweep.csv'}")
 
     res = target_reversion_check(panel, date_col, sym_col, regime_col, signals, a.min_names)
     if res.empty:
@@ -366,6 +410,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "file is found.")
     ap.add_argument("--horizon", type=int, default=5,
                     help="forward horizon (days) for the target-check (default 5)")
+    ap.add_argument("--by-horizon", action="store_true",
+                    help="sweep multiple forward horizons (see --horizons) to show WHERE the "
+                         "reversion lives, e.g. strong at 1-5d and fading by 20d.")
+    ap.add_argument("--horizons", default="1,3,5,10,20",
+                    help="comma-separated forward horizons for --by-horizon (default 1,3,5,10,20)")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
 
