@@ -243,6 +243,15 @@ class Config:
     do_wq_xsection: bool = True
     max_features: Optional[int] = None
 
+    # seed whitelist (e.g. feature-imp gain%/KEEP list): force these in as
+    # first-class candidates AND as interaction seeds for PAIRS/REGIME gates, so
+    # high-gain-but-modest-univariate-IC features (which earn their gain through
+    # interactions) get their interactions explored instead of being skipped.
+    seed_features_path: Optional[Path] = None
+    seed_whitelist_max: int = 20        # cap whitelist size (by gain order in the file)
+    seed_cap: int = 32                  # cap on the combined per-horizon seed set (bounds pair blow-up)
+    seed_force_keep: bool = True        # re-include whitelisted features dropped by leaky/level/coverage filters
+
     # leakage / sanity
     exclude_leaky_wq: bool = True
     exclude_level_features: bool = True   # drop raw price/size LEVEL features (static-tilt artifacts)
@@ -271,7 +280,7 @@ class Config:
         return self.nw_lag if self.nw_lag is not None else self.primary_horizon
 
     def __post_init__(self):
-        for a in ("panel_path", "cache_dir", "out_dir"):
+        for a in ("panel_path", "cache_dir", "out_dir", "seed_features_path"):
             v = getattr(self, a)
             if v is not None:
                 setattr(self, a, Path(v))
@@ -615,7 +624,87 @@ def build_day_regimes(panel: pd.DataFrame) -> pd.DataFrame:
 
 # ───────────────────────── feature selection ─────────────────────────
 
-def pick_features(panel: pd.DataFrame, cfg: Config) -> List[str]:
+def load_seed_features(path: Optional[Path], max_n: Optional[int] = None) -> List[str]:
+    """Load a whitelist of feature names from a feature-imp artifact.
+
+    Supports:
+      • feature_pruning_recommendation.csv  -> drops DROP/DROP_HARMFUL rows, orders
+        by gain_pct desc, takes the `feature` column.
+      • *.json  -> {"features":[...]} or {"keep_list_global":[...]} or a bare list.
+      • *.txt   -> one feature per line (# comments ignored).
+    Returns a de-duplicated, order-preserving list (capped at max_n if given)."""
+    if path is None:
+        return []
+    p = Path(path)
+    if not p.exists():
+        print(f"SEED  WARNING: seed-features file not found: {p}")
+        return []
+    feats: List[str] = []
+    try:
+        suf = p.suffix.lower()
+        if suf == ".csv":
+            df = pd.read_csv(p)
+            fcol = "feature" if "feature" in df.columns else df.columns[0]
+            if "recommendation" in df.columns:
+                rec = df["recommendation"].astype(str).str.upper()
+                df = df[~rec.str.startswith("DROP")]
+            if "gain_pct" in df.columns:
+                df = df.sort_values("gain_pct", ascending=False)
+            feats = [str(x) for x in df[fcol].tolist()]
+        elif suf == ".json":
+            obj = json.loads(p.read_text())
+            if isinstance(obj, dict):
+                feats = list(obj.get("features", obj.get("keep_list_global", [])))
+            elif isinstance(obj, list):
+                feats = list(obj)
+        else:
+            feats = [ln.strip() for ln in p.read_text().splitlines()
+                     if ln.strip() and not ln.lstrip().startswith("#")]
+    except Exception as e:
+        print(f"SEED  WARNING: could not parse {p}: {e}")
+        return []
+    seen, uniq = set(), []
+    for f in feats:
+        if f and f not in seen:
+            seen.add(f)
+            uniq.append(f)
+    n_total = len(uniq)
+    if max_n:
+        uniq = uniq[:max_n]
+    print(f"SEED  loaded {len(uniq)} whitelist features from {p.name}"
+          + (f" (capped from {n_total})" if max_n and n_total > max_n else ""))
+    return uniq
+
+
+def discover_seed_file(cfg: Config) -> Optional[Path]:
+    """Best-effort search for a feature_pruning_recommendation.csv near the panel."""
+    roots = []
+    if cfg.panel_path:
+        roots.append(Path(cfg.panel_path).parent)
+    roots.append(Path("."))
+    subdirs = ["", "feature_diagnostics", "feature_diagnostics_1d", "feature_diagnostics_2d",
+               "feature_diagnostics_3d", "feature_diagnostics_5d"]
+    for r in roots:
+        for sd in subdirs:
+            p = (r / sd / "feature_pruning_recommendation.csv") if sd else (r / "feature_pruning_recommendation.csv")
+            if p.exists():
+                return p
+    return None
+
+
+def _merge_seeds(whitelist: List[str], ic_seeds: List[str], cap: int) -> List[str]:
+    """Combine the gain%/whitelist seeds (FIRST, so they're guaranteed) with the
+    univariate-IC seeds, de-duplicated and capped to bound pair combinatorics."""
+    out: List[str] = []
+    for f in list(whitelist) + list(ic_seeds):
+        if f not in out:
+            out.append(f)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def pick_features(panel: pd.DataFrame, cfg: Config, whitelist: Optional[List[str]] = None) -> List[str]:
     cols = list(panel.columns)
     feats = [c for c in cols
              if isinstance(c, str)
@@ -648,6 +737,27 @@ def pick_features(panel: pd.DataFrame, cfg: Config) -> List[str]:
             out.append(c)
     if cfg.max_features:
         out = out[:cfg.max_features]
+
+    # SEED force-keep: re-include whitelisted (high-gain) features the filters
+    # dropped (leaky-WQ / level / coverage / max_features), so the user's
+    # importance picks are always scored. The static-tilt / leakage verdicts still
+    # apply downstream, so this is safe.
+    if whitelist and cfg.seed_force_keep:
+        readded = []
+        for f in whitelist:
+            if not isinstance(f, str) or f in out or f not in cols:
+                continue
+            s = pd.to_numeric(panel[f], errors="coerce")
+            if s.notna().mean() >= 0.30 and s.nunique(dropna=True) > 5:
+                panel[f] = s
+                out.append(f)
+                tag = ("leaky-WQ" if f in LEAKY_WQ_DEFAULT
+                       else "level" if is_level_feature(f) else "filtered")
+                readded.append(f"{f}({tag})")
+        if readded:
+            print(f"SEED  force-kept {len(readded)} whitelisted feature(s) the filters had "
+                  f"dropped: {', '.join(readded)}")
+
     print(f"Usable model features: {len(out)}")
     return out
 
@@ -1017,20 +1127,28 @@ def _iter_wq_xsection(engine: ScoreEngine, panel: pd.DataFrame, cfg: Config):
             yield dict(name=nm, kind="wq_xsection", horizon=h, feature=nm, signal=arr)
 
 
-def generate_strategies(engine: ScoreEngine, panel: pd.DataFrame, feats: List[str], cfg: Config):
+def generate_strategies(engine: ScoreEngine, panel: pd.DataFrame, feats: List[str],
+                        cfg: Config, whitelist: Optional[List[str]] = None):
     """Yield all strategy specs from every enabled generator.
 
     Engineered families (PAIRS / REGIME GATES / COMPOSITES) are generated at EVERY
     requested horizon when cfg.engineered_all_horizons is True, each seeded by that
     horizon's own univariate ranking. Previously they ran only at the primary horizon,
-    which left 1-3d explored by raw singles alone."""
+    which left 1-3d explored by raw singles alone.
+
+    A `whitelist` (e.g. the feature-imp gain%/KEEP list) is merged into the seed set
+    for PAIRS and REGIME GATES so high-gain features get their interactions explored
+    even when their standalone IC rank is modest. Singles already cover every feature."""
+    whitelist = [f for f in (whitelist or []) if f in feats]
     yield from _iter_singles(engine, feats, cfg)
 
     horizons = tuple(cfg.horizons) if cfg.engineered_all_horizons else (cfg.primary_horizon,)
     for h in horizons:
         ranked = _rank_feats_by_ir(engine, feats, cfg, h)
-        top_pairs = [f for f, _ in ranked[:cfg.top_k_pairs]]
-        top_regime = [f for f, _ in ranked[:cfg.top_k_regime]]
+        ic_pairs = [f for f, _ in ranked[:cfg.top_k_pairs]]
+        ic_regime = [f for f, _ in ranked[:cfg.top_k_regime]]
+        top_pairs = _merge_seeds(whitelist, ic_pairs, cfg.seed_cap)
+        top_regime = _merge_seeds(whitelist, ic_regime, cfg.seed_cap)
         if cfg.do_pairs and len(top_pairs) >= 2:
             yield from _iter_pairs(engine, top_pairs, cfg, h)
         if cfg.do_regime_gates and top_regime:
@@ -1049,16 +1167,31 @@ def run(cfg: Config) -> pd.DataFrame:
     panel = load_panel(cfg)
     survivorship_check(panel)
     target_cols = build_targets(panel, cfg)
-    feats = pick_features(panel, cfg)
+
+    # Seed whitelist (feature-imp gain%/KEEP list) -> first-class candidates + seeds.
+    seed_path = cfg.seed_features_path
+    if isinstance(seed_path, Path) and str(seed_path).upper() == "AUTO":
+        seed_path = discover_seed_file(cfg)
+        if seed_path:
+            print(f"SEED  auto-discovered: {seed_path}")
+        else:
+            print("SEED  --seed-features AUTO: no feature_pruning_recommendation.csv found nearby.")
+    whitelist_all = load_seed_features(seed_path, cfg.seed_whitelist_max) if seed_path else []
+
+    feats = pick_features(panel, cfg, whitelist=whitelist_all)
     if not feats:
         raise SystemExit("No usable features after filtering.")
+    whitelist = [f for f in whitelist_all if f in feats]
+    if whitelist_all:
+        print(f"SEED  {len(whitelist)}/{len(whitelist_all)} whitelist features usable "
+              f"-> forced as singles + merged into PAIRS/REGIME seeds (cap {cfg.seed_cap}).")
 
     engine = ScoreEngine(panel, target_cols, cfg)
     print(f"Scoring frame: {len(engine.work):,} tradeable rows, {engine.D} days, "
           f"{engine.test_day_mask.sum()} test days (embargo {cfg.embargo_days}d).")
 
     # materialise specs (so we know N for multiple-testing & deflated Sharpe)
-    specs = list(generate_strategies(engine, panel, feats, cfg))
+    specs = list(generate_strategies(engine, panel, feats, cfg, whitelist=whitelist))
     N = len(specs)
     t_bar = expected_max_t(N)
     print(f"\nGenerated {N} strategies across "
@@ -1271,6 +1404,7 @@ def _write_outputs(res: pd.DataFrame, engine: ScoreEngine, cfg: Config,
                     cost_grid_bps=list(cfg.cost_grid_bps), beta_neutralize=cfg.beta_neutralize,
                     ic_floor=cfg.ic_floor, min_names_per_day=cfg.min_names_per_day,
                     use_model_target=cfg.use_model_target,
+                    seed_features=str(cfg.seed_features_path) if cfg.seed_features_path else None,
                     gating="effect_size_after_cost + OOS_persistence + economic_plausibility"),
     )
     with open(out_dir / "strategy_lab_summary.json", "w") as fh:
@@ -1476,6 +1610,22 @@ def self_test() -> int:
     print(f"  [{'PASS' if cond7 else 'FAIL'}] engineered families span multiple horizons: {sorted(eng_h)}")
     ok &= cond7
 
+    # 8) seed-whitelist loader + merge: DROP rows excluded, gain-ordered, capped;
+    #    whitelist guaranteed ahead of IC seeds.
+    import tempfile, os as _os
+    _csv = _os.path.join(tempfile.gettempdir(), "_seed_test.csv")
+    pd.DataFrame({
+        "feature": ["D_a", "D_b", "D_c", "D_d"],
+        "gain_pct": [1.0, 9.0, 5.0, 2.0],
+        "recommendation": ["KEEP", "KEEP", "DROP_HARMFUL", "REVIEW"],
+    }).to_csv(_csv, index=False)
+    wl = load_seed_features(Path(_csv), max_n=10)
+    cond8 = (wl == ["D_b", "D_d", "D_a"])   # DROP_HARMFUL removed, sorted by gain desc
+    merged = _merge_seeds(["D_b", "D_d"], ["D_x", "D_b", "D_y"], cap=3)
+    cond8 &= (merged == ["D_b", "D_d", "D_x"])  # whitelist first, dedup, capped
+    print(f"  [{'PASS' if cond8 else 'FAIL'}] seed loader/merge: wl={wl} merged={merged}")
+    ok &= cond8
+
     print("\n" + ("ALL SELF-TESTS PASSED" if ok else "SELF-TEST FAILURES ABOVE"))
     return 0 if ok else 1
 
@@ -1516,6 +1666,13 @@ def parse_args() -> Tuple[Config, bool]:
     p.add_argument("--no-wq", action="store_true")
     p.add_argument("--max-features", type=int, default=None)
     p.add_argument("--keep-leaky-wq", action="store_true")
+    p.add_argument("--seed-features", nargs="?", const="AUTO", default=None,
+                   help="feature-imp whitelist (feature_pruning_recommendation.csv / .json / .txt) "
+                        "to force in as candidates + PAIRS/REGIME seeds. Bare flag = auto-discover.")
+    p.add_argument("--seed-max", type=int, default=None, dest="seed_whitelist_max",
+                   help="cap on whitelist size (by gain order)")
+    p.add_argument("--seed-cap", type=int, default=None,
+                   help="cap on the combined per-horizon seed set (bounds pair count)")
     a = p.parse_args()
 
     cfg = Config()
@@ -1556,6 +1713,12 @@ def parse_args() -> Tuple[Config, bool]:
         cfg.do_wq_xsection = False
     if a.keep_leaky_wq:
         cfg.exclude_leaky_wq = False
+    if a.seed_features is not None:
+        cfg.seed_features_path = Path(a.seed_features)
+    if a.seed_whitelist_max is not None:
+        cfg.seed_whitelist_max = a.seed_whitelist_max
+    if a.seed_cap is not None:
+        cfg.seed_cap = a.seed_cap
     cfg.__post_init__()
     return cfg, False
 
