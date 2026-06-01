@@ -30,9 +30,11 @@ DROP / REVIEW recommendations were anchored to the wrong ground truth.
 
 v5 fixes all five and adds:
 
-  6. 5-fold purged time-series CV with embargo for permutation, so the
-     reported AUC drops are averaged across folds and the noise floor is
-     well-defined.
+  6. Purged time-series CV with embargo for permutation: with --cv-perm a fresh
+     model is fit inside each purged fold and the AUC drops are aggregated ACROSS
+     folds (mean/std/min/max), so the std is genuine fold-to-fold stability. (NOTE:
+     this is OPT-IN. Without --cv-perm the permutation runs on a single embargoed
+     OOT split and auc_drop_*_std is within-fold SHUFFLE jitter, not fold spread.)
   7. "Harmful feature" detection — features whose removal *improves*
      AUC (auc_drop < -0.0005 in 2+ regimes). These are dropped first.
   8. Feature family aggregation (D_, X_, W_, WQ_, M_, Comb_, regime_, ...)
@@ -90,7 +92,11 @@ Flags: --horizon H | --quantiles Q (top/bottom = 1/Q) | --embargo D (default H+1
             representative per cluster, demote the rest to REDUNDANT (permutation
             importance is unreliable on collinear twins). Off by default.
        --std-gate [--std-gate-k 1.0]  gate KEEP/DROP on perm-drop significance
-            (mean > k*shuffle_std) instead of the bare absolute PERM_DROP_KEEP.
+            (mean > k*perm_std) instead of the bare absolute PERM_DROP_KEEP, for
+            both the global AND per-regime drops.
+       --cv-perm [--cv-folds 5]  run permutation inside purged CV folds and report
+            mean/std/min/max ACROSS folds (the std then = fold-to-fold stability,
+            which makes --std-gate a real noise floor). Off by default.
 
 Model-anchored vs model-free: gain% and permutation AUC-drop require a model and
 are only meaningful for a model you actually built; the IC / regime-IC / category
@@ -218,9 +224,20 @@ class Config:
     cluster_corr: float = CORR_THRESHOLD    # correlation threshold for a cluster (0.85)
     # std-gated KEEP/DROP: gate on perm-drop SIGNIFICANCE (drop_mean > k*drop_std)
     # rather than the bare absolute PERM_DROP_KEEP=0.0010, which the docstring itself
-    # notes sits within the 5-shuffle noise band. Uses the std already computed.
+    # notes sits within the noise band. With cv_perm OFF the std is the within-fold
+    # SHUFFLE std (jitter only); with cv_perm ON it is the across-FOLD std (genuine
+    # temporal stability), which is what the docstring always claimed.
     std_gate: bool = False
-    std_gate_k: float = 1.0                 # significance multiple on the shuffle std
+    std_gate_k: float = 1.0                 # significance multiple on the perm std
+
+    # CV permutation (opt-in; default OFF preserves the single-split behaviour).
+    # The docstring promised "5-fold purged time-series CV ... averaged across folds"
+    # but the code only ever ran ONE embargoed split, so auc_drop_*_std was shuffle
+    # jitter, not fold-to-fold stability. When ON, permutation runs inside each purged
+    # fold (purged_kfold_indices) and we report mean/std/min/max ACROSS folds; the
+    # std-gate then uses the across-fold std — a real noise floor.
+    cv_perm: bool = False
+    cv_folds: int = CV_FOLDS                 # number of purged folds when cv_perm is on
 
     def embargo(self) -> int:
         return int(self.embargo_days) if self.embargo_days is not None else int(self.horizon) + 1
@@ -590,6 +607,80 @@ class _PermEngine:
         if len(drops) == 0:
             return np.nan, np.nan
         return float(drops.mean()), float(drops.std(ddof=0))
+
+
+def cv_permutation_importance(
+    fit_model_fn,
+    X_full: pd.DataFrame,
+    y_full: np.ndarray,
+    timestamps: pd.Series,
+    features: List[str],
+    *,
+    n_folds: int,
+    embargo_days: int,
+    n_shuffles: int,
+    seed_salt: int = 0,
+    desc: str = "cv perm",
+) -> pd.DataFrame:
+    """Permutation importance across PURGED time-series folds.
+
+    For each (train_idx, test_idx) from purged_kfold_indices: fit a fresh model on
+    the fold's train rows (via fit_model_fn(X_tr, y_tr) -> fitted estimator with
+    predict_proba), then permute each feature on the fold's test rows. The per-fold
+    mean-over-shuffles drop is one observation; we aggregate ACROSS folds into
+    mean / std / min / max — so the std is genuine fold-to-fold (temporal) stability,
+    not within-fold shuffle jitter. Folds where a model can't be fit / scored
+    (e.g. single-class y) are skipped.
+
+    Returns a DataFrame indexed by feature with columns:
+      auc_drop_global_mean, auc_drop_global_std, auc_drop_global_min,
+      auc_drop_global_max, n_folds_used.
+    """
+    per_feat: Dict[str, List[float]] = {f: [] for f in features}
+    folds_used = 0
+    ts = pd.to_datetime(timestamps).reset_index(drop=True)
+    X_full = X_full.reset_index(drop=True)
+    y_full = np.asarray(y_full)
+    for fi, (tr_idx, te_idx) in enumerate(
+        purged_kfold_indices(ts, n_folds, embargo_days)
+    ):
+        if len(tr_idx) < 200 or len(te_idx) < 200:
+            continue
+        y_tr, y_te = y_full[tr_idx], y_full[te_idx]
+        if len(np.unique(y_tr)) < 2 or len(np.unique(y_te)) < 2:
+            continue
+        X_tr = X_full.iloc[tr_idx].reset_index(drop=True)
+        X_te = X_full.iloc[te_idx].reset_index(drop=True)
+        try:
+            model = fit_model_fn(X_tr, y_tr)
+        except Exception:
+            continue
+        eng = _PermEngine(model, features, X_probe=X_te)
+        try:
+            base_auc = roc_auc_score(y_te, eng.base_probs(X_te))
+        except Exception:
+            continue
+        folds_used += 1
+        for feat in tqdm(features, desc=f"  {desc} f{fi}", leave=False):
+            m, _ = eng.perm_drop(X_te, y_te, feat, base_auc=base_auc,
+                                 n_shuffles=n_shuffles, seed=_feat_seed(feat, salt=seed_salt + fi))
+            if pd.notna(m):
+                per_feat[feat].append(float(m))
+    rows = []
+    for f in features:
+        vals = np.array(per_feat[f], dtype=float)
+        if vals.size == 0:
+            rows.append({"feature": f, "auc_drop_global_mean": np.nan,
+                         "auc_drop_global_std": np.nan, "auc_drop_global_min": np.nan,
+                         "auc_drop_global_max": np.nan, "n_folds_used": 0})
+        else:
+            rows.append({"feature": f,
+                         "auc_drop_global_mean": float(vals.mean()),
+                         "auc_drop_global_std": float(vals.std(ddof=0)),
+                         "auc_drop_global_min": float(vals.min()),
+                         "auc_drop_global_max": float(vals.max()),
+                         "n_folds_used": int(vals.size)})
+    return pd.DataFrame(rows).set_index("feature")
 
 
 def spearman_ic_block(Xvals: np.ndarray, colnames: List[str], target: np.ndarray) -> Dict[str, float]:
@@ -1116,25 +1207,51 @@ def main(cfg: Config):
     # =========================================================================
     print(f"\n[6/9] PERMUTATION IMPORTANCE ({PERM_SHUFFLES} shuffles per feature)...")
 
-    global_perm_rows = []
-    model_global = fallback_model if unwrap_to_score(fallback_model) is not None else clf_diag
-    eng_g = _PermEngine(model_global, FEATURES, X_probe=X_te)
-    base_auc_global = roc_auc_score(y_te, eng_g.base_probs(X_te))
-    print(f"[6/9] Global base AUC (prod model on OOT test): {base_auc_global:.4f}")
-    if eng_g.union_used is not None:
-        print(f"[6/9] Model splits on {len(eng_g.union_used)}/{len(FEATURES)} features; "
-              f"the rest get an EXACT 0-drop without scoring."
-              + ("  [member-caching ON]" if eng_g.use_member_cache else ""))
-    for feat in tqdm(FEATURES, desc="  global perm"):
-        m, s = eng_g.perm_drop(X_te, y_te, feat, base_auc=base_auc_global,
-                               n_shuffles=PERM_SHUFFLES, seed=_feat_seed(feat))
-        global_perm_rows.append({
-            "feature": feat,
-            "auc_drop_global_mean": m,
-            "auc_drop_global_std": s,
-        })
-    global_perm_df = pd.DataFrame(global_perm_rows).set_index("feature")
-    global_perm_df.to_csv(out_dir / "feature_permutation_importance.csv")
+    if cfg.cv_perm:
+        # Across-fold permutation: fit a fresh diagnostic model inside each purged
+        # fold and aggregate drops ACROSS folds (mean/std/min/max). This is the
+        # "5-fold purged CV averaged across folds" the docstring always promised; the
+        # std is now genuine fold-to-fold stability, not within-fold shuffle jitter.
+        # Runs on the labeled rows up to the embargoed cut (train+cal), leaving the
+        # OOT test split untouched for the rest of the report.
+        def _fit_diag(X_tr_f, y_tr_f):
+            mdl = lgb.LGBMClassifier(**DIAG_LGB_PARAMS)
+            mdl.fit(X_tr_f, y_tr_f)
+            return mdl
+        cv_mask = ~test_mask
+        X_cv = X_full.iloc[cv_mask].reset_index(drop=True)
+        y_cv = y_full[cv_mask]
+        ts_cv = labeled["timestamp"].iloc[cv_mask].reset_index(drop=True)
+        global_perm_df = cv_permutation_importance(
+            _fit_diag, X_cv, y_cv, ts_cv, FEATURES,
+            n_folds=cfg.cv_folds, embargo_days=EMBARGO_DAYS,
+            n_shuffles=PERM_SHUFFLES, seed_salt=0, desc="global perm",
+        )
+        _used = global_perm_df["n_folds_used"].max()
+        base_auc_global = base_auc
+        print(f"[6/9] CV permutation across up to {int(_used) if pd.notna(_used) else 0} "
+              f"purged folds (embargo {EMBARGO_DAYS}d); std/min/max are fold-to-fold.")
+        global_perm_df.to_csv(out_dir / "feature_permutation_importance.csv")
+    else:
+        global_perm_rows = []
+        model_global = fallback_model if unwrap_to_score(fallback_model) is not None else clf_diag
+        eng_g = _PermEngine(model_global, FEATURES, X_probe=X_te)
+        base_auc_global = roc_auc_score(y_te, eng_g.base_probs(X_te))
+        print(f"[6/9] Global base AUC (prod model on OOT test): {base_auc_global:.4f}")
+        if eng_g.union_used is not None:
+            print(f"[6/9] Model splits on {len(eng_g.union_used)}/{len(FEATURES)} features; "
+                  f"the rest get an EXACT 0-drop without scoring."
+                  + ("  [member-caching ON]" if eng_g.use_member_cache else ""))
+        for feat in tqdm(FEATURES, desc="  global perm"):
+            m, s = eng_g.perm_drop(X_te, y_te, feat, base_auc=base_auc_global,
+                                   n_shuffles=PERM_SHUFFLES, seed=_feat_seed(feat))
+            global_perm_rows.append({
+                "feature": feat,
+                "auc_drop_global_mean": m,
+                "auc_drop_global_std": s,
+            })
+        global_perm_df = pd.DataFrame(global_perm_rows).set_index("feature")
+        global_perm_df.to_csv(out_dir / "feature_permutation_importance.csv")
 
     # Per-regime permutation on prod regime models
     regime_perm: Dict[str, Dict[str, Tuple[float, float]]] = {r: {} for r in REGIMES}
@@ -1266,42 +1383,56 @@ def main(cfg: Config):
         rec[f"auc_drop_{r}"] = rec["feature"].map(
             regime_perm_df[f"auc_drop_{r}"].to_dict()
         )
+        if f"auc_drop_{r}_std" in regime_perm_df.columns:
+            rec[f"auc_drop_{r}_std"] = rec["feature"].map(
+                regime_perm_df[f"auc_drop_{r}_std"].to_dict()
+            )
         rec[f"ic_{r}"] = rec["feature"].map(regime_ic_df[f"ic_{r}"].to_dict())
+
+    def _eff_bars(row):
+        """Effective KEEP / DEAD perm bars. With std_gate ON, lift the bare absolute
+        thresholds to k * the perm std for the global AND per-regime drops (the
+        per-regime drops are the noisiest and most in need of gating)."""
+        gkeep, gdead = PERM_DROP_KEEP * 3, PERM_DROP_KEEP
+        rkeep = {r: PERM_DROP_KEEP for r in REGIMES}
+        rexc = {r: REGIME_EXCEPTIONAL for r in REGIMES}
+        if cfg.std_gate:
+            gstd = row.get("auc_drop_global_std")
+            if pd.notna(gstd) and gstd > 0:
+                sig = cfg.std_gate_k * float(gstd)
+                gkeep, gdead = max(gkeep, sig), max(gdead, sig)
+            for r in REGIMES:
+                rstd = row.get(f"auc_drop_{r}_std")
+                if pd.notna(rstd) and rstd > 0:
+                    sig = cfg.std_gate_k * float(rstd)
+                    rkeep[r] = max(rkeep[r], sig)
+                    rexc[r] = max(rexc[r], sig)
+        return gkeep, gdead, rkeep, rexc
 
     def recommend(row) -> str:
         # Check harmful first — these are dropped with high priority
         if row.get("is_harmful_anywhere"):
             return "DROP_HARMFUL"
-        regime_drops = [row.get(f"auc_drop_{r}") for r in REGIMES]
-        regime_drops = [d for d in regime_drops if pd.notna(d)]
+        regime_drops = {r: row.get(f"auc_drop_{r}") for r in REGIMES}
+        regime_drops = {r: d for r, d in regime_drops.items() if pd.notna(d)}
         regime_ics = [abs(row.get(f"ic_{r}", np.nan)) for r in REGIMES]
         regime_ics = [v for v in regime_ics if pd.notna(v)]
         global_perm = row.get("auc_drop_global_mean") or 0.0
         mean_abs_ic = row.get("mean_abs_ic") or 0.0
-        # std-gate: require the global perm drop to clear k * (its shuffle std), not
-        # just the bare absolute PERM_DROP_KEEP (which sits inside the noise band).
-        # perm_keep_eff is the effective "useful" bar; perm_dead is the "no real
-        # signal" bar used by the DROP test.
-        perm_keep_eff = PERM_DROP_KEEP * 3
-        perm_dead = PERM_DROP_KEEP
-        if cfg.std_gate:
-            gstd = row.get("auc_drop_global_std")
-            if pd.notna(gstd) and gstd > 0:
-                sig = cfg.std_gate_k * float(gstd)
-                perm_keep_eff = max(perm_keep_eff, sig)
-                perm_dead = max(perm_dead, sig)
-        # KEEP signals
-        if regime_drops and max(regime_drops) >= REGIME_EXCEPTIONAL:
+        gkeep, gdead, rkeep, rexc = _eff_bars(row)
+        # KEEP signals (regime-exceptional bar std-gated per regime)
+        if any(d >= rexc[r] for r, d in regime_drops.items()):
             return "KEEP"
         if regime_ics and max(regime_ics) >= IC_THRESHOLD * 2:
             return "KEEP"
-        if global_perm >= perm_keep_eff:
+        if global_perm >= gkeep:
             return "KEEP"
         if mean_abs_ic >= IC_THRESHOLD * 2:
             return "KEEP"
-        # DROP signals
-        dead_all_regimes = bool(regime_drops) and all(d < PERM_DROP_KEEP for d in regime_drops)
-        dead_global = global_perm < perm_dead
+        # DROP signals (each regime below ITS std-gated bar)
+        dead_all_regimes = bool(regime_drops) and all(
+            d < rkeep[r] for r, d in regime_drops.items())
+        dead_global = global_perm < gdead
         weak_ic = mean_abs_ic < IC_THRESHOLD
         if dead_all_regimes and dead_global and weak_ic:
             return "DROP"
@@ -1310,20 +1441,24 @@ def main(cfg: Config):
     def explain(row) -> str:
         rec_val = row["recommendation"]
         parts = []
+        gkeep, gdead, rkeep, rexc = _eff_bars(row)
         regime_drops = {r: row.get(f"auc_drop_{r}") for r in REGIMES}
         valid = [(r, d) for r, d in regime_drops.items() if pd.notna(d)]
         if rec_val == "DROP_HARMFUL":
             harmful = [(r, d) for r, d in regime_drops.items() if pd.notna(d) and d < PERM_DROP_HARMFUL]
             return f"Harmful in: " + ", ".join(f"{r}({d:.4f})" for r, d in harmful)
+        if rec_val == "REDUNDANT":
+            return row.get("cluster_role") or "redundant in correlation cluster"
         if rec_val == "KEEP":
-            if valid:
-                best = max(valid, key=lambda x: x[1])
-                if best[1] >= REGIME_EXCEPTIONAL:
-                    parts.append(f"Strong in {best[0]} ({best[1]:.4f})")
+            exc = [(r, d) for r, d in valid if d >= rexc[r]]
+            if exc:
+                best = max(exc, key=lambda x: x[1])
+                parts.append(f"Strong in {best[0]} ({best[1]:.4f})")
             if pd.notna(row.get("mean_abs_ic")) and row["mean_abs_ic"] >= IC_THRESHOLD * 2:
                 parts.append(f"Strong IC ({row['mean_abs_ic']:.4f})")
-            if pd.notna(row.get("auc_drop_global_mean")) and row["auc_drop_global_mean"] >= PERM_DROP_KEEP * 3:
-                parts.append(f"Strong global perm ({row['auc_drop_global_mean']:.4f})")
+            gp = row.get("auc_drop_global_mean")
+            if pd.notna(gp) and gp >= gkeep:
+                parts.append(f"Strong global perm ({gp:.4f})")
         elif rec_val == "DROP":
             parts.append("Dead in all regimes & global")
             if pd.notna(row.get("mean_abs_ic")):
@@ -1367,19 +1502,35 @@ def main(cfg: Config):
         gp = rec.set_index("feature")["auc_drop_global_mean"].to_dict()
         ic = rec.set_index("feature")["mean_abs_ic"].to_dict()
         recm = rec.set_index("feature")["recommendation"].to_dict()
+        spec = rec.set_index("feature")["regime_specialist"].to_dict() \
+            if "regime_specialist" in rec.columns else {}
         new_rec = dict(recm)
         roles: Dict[str, str] = {f: "" for f in rec["feature"]}
         demoted = 0
         rescued = 0
+        protected = 0
         for cid, grp in rec.groupby("cluster_id"):
             members = list(grp["feature"])
             if len(members) < 2:
                 continue
-            # representative = best by (perm drop, then |IC|)
+            # FIX #2: a member that is the unique carrier in some regime
+            # (regime_specialist) is exactly what global metrics undervalue and what a
+            # regime-gated strategy most needs. PROTECT it from demotion — it is not
+            # interchangeable with the cluster representative.
+            protected_members = [f for f in members if bool(spec.get(f))]
+            for f in protected_members:
+                roles[f] = "kept(regime-specialist; protected)"
+            protected += len(protected_members)
+            demotable = [f for f in members if f not in protected_members]
+            if not demotable:
+                continue
+            # FIX #1: rank the representative by |IC| FIRST (collinearity-robust:
+            # univariate IC is NOT masked by a twin), perm drop only as a tiebreaker.
+            # Ranking on the masked perm metric first can crown the weaker carrier.
             members_sorted = sorted(
-                members,
-                key=lambda f: (gp.get(f, 0.0) if pd.notna(gp.get(f)) else 0.0,
-                               ic.get(f, 0.0) if pd.notna(ic.get(f)) else 0.0),
+                demotable,
+                key=lambda f: (abs(ic.get(f, 0.0)) if pd.notna(ic.get(f)) else 0.0,
+                               gp.get(f, 0.0) if pd.notna(gp.get(f)) else 0.0),
                 reverse=True,
             )
             rep = members_sorted[0]
@@ -1404,11 +1555,24 @@ def main(cfg: Config):
                 demoted += 1
         rec["recommendation"] = rec["feature"].map(new_rec)
         rec["cluster_role"] = rec["feature"].map(roles)
+        # audit: min |corr| inside each multi-member cluster (catches single-linkage
+        # over-merges where A-B-C chain but A,C are not mutually redundant).
+        min_corr = {f: np.nan for f in rec["feature"]}
+        for cid, grp in rec.groupby("cluster_id"):
+            ms = [f for f in grp["feature"] if f in corr_mat.columns]
+            if len(ms) >= 2:
+                sub = corr_mat.loc[ms, ms].abs()
+                off = sub.where(~np.eye(len(ms), dtype=bool))
+                mn = float(np.nanmin(off.to_numpy()))
+                for f in grp["feature"]:
+                    min_corr[f] = mn
+        rec["cluster_min_abs_corr"] = rec["feature"].map(min_corr)
         n_clusters = rec["cluster_id"].nunique()
         n_multi = int((rec.groupby("cluster_id")["feature"].transform("size") > 1).sum())
         print(f"[9/9] Cluster-aware pruning: {n_clusters} clusters "
               f"(|r|>={cfg.cluster_corr}); {n_multi} features in multi-member clusters; "
-              f"{demoted} demoted to REDUNDANT; {rescued} representative(s) rescued from perm-mask.")
+              f"{demoted} -> REDUNDANT; {rescued} rep(s) rescued from perm-mask; "
+              f"{protected} regime-specialist(s) protected.")
 
     # NEW: strategy-category tags (breakout / mean_reversion / momentum_trend / ...)
     _cat = {f: categorize(f) for f in rec["feature"]}
@@ -1773,6 +1937,34 @@ def _self_test() -> int:
     assert cc.cluster_prune and cc.cluster_corr == 0.9 and cc.std_gate and cc.std_gate_k == 1.5
     print("[test] cluster-prune / std-gate config: OK")
 
+    # cv_perm config + cv_permutation_importance across folds
+    cd = Config(cv_perm=True, cv_folds=4)
+    assert cd.cv_perm and cd.cv_folds == 4
+    rng2 = np.random.default_rng(3)
+    nrows = 1200
+    Xcv = pd.DataFrame({
+        "D_good": rng2.normal(size=nrows),
+        "D_dead": rng2.normal(size=nrows),
+    })
+    ycv = (Xcv["D_good"] + rng2.normal(scale=0.5, size=nrows) > 0).astype(int).to_numpy()
+    tscv = pd.Series(pd.date_range("2020-01-01", periods=nrows, freq="h"))
+    def _fit(xx, yy):
+        mm = LGBMClassifier(n_estimators=40, num_leaves=15, min_data_in_leaf=40,
+                            random_state=0, verbosity=-1)
+        mm.fit(xx, yy); return mm
+    cvres = cv_permutation_importance(_fit, Xcv, ycv, tscv, ["D_good", "D_dead"],
+                                      n_folds=4, embargo_days=1, n_shuffles=3, desc="t")
+    for col in ["auc_drop_global_mean", "auc_drop_global_std",
+                "auc_drop_global_min", "auc_drop_global_max", "n_folds_used"]:
+        assert col in cvres.columns, f"cv perm missing {col}"
+    assert cvres.loc["D_good", "n_folds_used"] >= 2
+    assert cvres.loc["D_good", "auc_drop_global_mean"] > cvres.loc["D_dead", "auc_drop_global_mean"]
+    # min <= mean <= max sanity
+    g = cvres.loc["D_good"]
+    assert g["auc_drop_global_min"] <= g["auc_drop_global_mean"] + 1e-9 <= g["auc_drop_global_max"] + 1e-9
+    print(f"[test] cv_permutation_importance (folds + min/mean/max): OK "
+          f"(good_mean={g['auc_drop_global_mean']:.4f}, std={g['auc_drop_global_std']:.4f})")
+
     print("\nALL SELF-TESTS PASSED")
     return 0
 
@@ -1813,7 +2005,12 @@ if __name__ == "__main__":
                         help="gate KEEP/DROP on perm-drop significance (mean > k*std) instead of "
                              "the bare absolute threshold")
     parser.add_argument("--std-gate-k", type=float, default=None,
-                        help="significance multiple on the shuffle std (default 1.0)")
+                        help="significance multiple on the perm std (default 1.0)")
+    parser.add_argument("--cv-perm", action="store_true",
+                        help="run permutation inside purged CV folds and report mean/std/min/max "
+                             "ACROSS folds (the std becomes fold-to-fold stability, not shuffle jitter)")
+    parser.add_argument("--cv-folds", type=int, default=None,
+                        help="number of purged folds when --cv-perm is on (default 5)")
     parser.add_argument("--self-test", action="store_true",
                         help="Validate fast-path numeric equivalence + categories on synthetic data; no real data needed")
     args = parser.parse_args()
@@ -1835,5 +2032,7 @@ if __name__ == "__main__":
         cluster_corr=args.cluster_corr if args.cluster_corr is not None else CORR_THRESHOLD,
         std_gate=args.std_gate,
         std_gate_k=args.std_gate_k if args.std_gate_k is not None else 1.0,
+        cv_perm=args.cv_perm,
+        cv_folds=args.cv_folds if args.cv_folds is not None else CV_FOLDS,
     )
     main(cfg)
