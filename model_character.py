@@ -21,10 +21,13 @@ WHY THIS DESIGN
 
 INPUTS (all optional; sensible defaults)
   --scored   path to a scored file with a probability column + symbol + date.
-             Default: watchlist_5d_signal.csv in --out-dir or CWD.
-             A FULL-panel scored file (many dates) gives the most robust read;
-             the default watchlist is a single latest cross-section, which is
-             exactly the snapshot you were eyeballing.
+             Preferred: panel_scored.parquet (FULL panel — every symbol, every
+             day — written by New_model's export_full_panel_scores). This gives
+             a robust read across ALL history. If absent, falls back to
+             watchlist_5d_signal.csv, which is only the latest single
+             cross-section (the snapshot you were eyeballing).
+  --since / --until : restrict to a date range, e.g. the embargoed TEST window
+             for a strictly leak-free read (panel_scored is scored in-sample).
   --panel    path to panel_cache.parquet (the enriched panel). Used to compute
              true trailing returns ret_{5,20,60}d_past. If omitted, the script
              falls back to the extension features already present in --scored.
@@ -177,6 +180,47 @@ def prob_decile_profile(df: pd.DataFrame, prob_col: str, date_col: str,
     return prof
 
 
+# ── target-level reversion check (NEEDS ONLY THE PANEL — no model/probs) ──────
+def compute_forward_target(panel: pd.DataFrame, symbol_col: str, date_col: str,
+                           horizon: int = 5) -> pd.DataFrame:
+    """Add _fwd_target = vol-adjusted forward `horizon`-day return, matching the
+    model's label (ret / atr_pct), causal-shifted forward. This is the thing the
+    model is trained to predict."""
+    p = panel.sort_values([symbol_col, date_col]).copy()
+    close = pd.to_numeric(p["close"], errors="coerce")
+    fwd = p.groupby(symbol_col, observed=True)["close"].transform(
+        lambda s, h=horizon: s.shift(-h) / s - 1.0)
+    atr_pct = None
+    if "atr_pct" in p.columns:
+        atr_pct = pd.to_numeric(p["atr_pct"], errors="coerce")
+    elif "D_atr14" in p.columns:
+        atr_pct = (pd.to_numeric(p["D_atr14"], errors="coerce") /
+                   close.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan) * 100.0
+    p["_fwd_target"] = (fwd / atr_pct.replace(0, np.nan)) if atr_pct is not None else fwd
+    return p
+
+
+def target_reversion_check(panel: pd.DataFrame, date_col: str, symbol_col: str,
+                           regime_col: Optional[str], signals: List[str],
+                           min_names: int) -> pd.DataFrame:
+    """Per-day cross-sectional corr(recent-strength, FORWARD target).
+    corr < 0  =>  recent winners earn LOWER forward returns  =>  the OPPORTUNITY
+    itself is mean-reversion (so any decent model on this target is contrarian)."""
+    rows = []
+    groups: List[Tuple[str, pd.DataFrame]] = [("ALL", panel)]
+    if regime_col and regime_col in panel.columns:
+        for rv, sub in panel.groupby(regime_col):
+            groups.append((str(rv), sub))
+    for sig in signals:
+        if sig not in panel.columns:
+            continue
+        for gname, gdf in groups:
+            corr, ndays, nobs = xs_spearman(gdf, date_col, sig, "_fwd_target", min_names)
+            rows.append({"signal": sig, "group": gname,
+                         "corr_recent_vs_forward": corr, "n_days": ndays, "n_obs": nobs})
+    return pd.DataFrame(rows)
+
+
 # ── self-test ─────────────────────────────────────────────────────────────--
 def _build_synthetic(seed=0, contrarian=True, n_days=40, n_names=120) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
@@ -236,6 +280,114 @@ def classify(mean_corr: float) -> str:
     return "STRONGLY MOMENTUM"
 
 
+def horizon_sweep(panel: pd.DataFrame, date_col: str, sym_col: str,
+                  predictors: List[str], horizons: List[int], min_names: int) -> pd.DataFrame:
+    """corr(recent-strength predictor, forward return @ each horizon H).
+
+    Returns a (predictor x horizon) table of cross-sectional rank correlations.
+    Reading: strongly negative at short H that rises toward 0/positive at longer
+    H is the classic short-term-reversal signature — it tells you the holding
+    period the reversion edge actually supports.
+    """
+    out: Dict[int, Dict[str, float]] = {}
+    for h in horizons:
+        p = compute_forward_target(panel, sym_col, date_col, horizon=int(h))
+        col: Dict[str, float] = {}
+        for sig in predictors:
+            if sig not in p.columns:
+                continue
+            corr, _, _ = xs_spearman(p, date_col, sig, "_fwd_target", min_names)
+            col[sig] = corr
+        out[int(h)] = col
+    piv = pd.DataFrame(out)
+    piv.columns = [f"{h}d" for h in piv.columns]
+    return piv
+
+
+def _run_target_check(a) -> int:
+    """PANEL-ONLY: is the opportunity (the model's target) mean-reverting?"""
+    panel = _load_any(Path(a.panel))
+    date_col = a.date_col or _pick(list(panel.columns), DATE_CANDIDATES)
+    sym_col = a.symbol_col or _pick(list(panel.columns), SYMBOL_CANDIDATES)
+    regime_col = a.regime_col or _pick(list(panel.columns), REGIME_CANDIDATES)
+    if not date_col or not sym_col or "close" not in panel.columns:
+        print(f"ERROR: panel needs close + symbol + date. Found date={date_col} "
+              f"symbol={sym_col} close={'close' in panel.columns}.", file=sys.stderr)
+        return 3
+    panel[date_col] = _norm_date(panel[date_col])
+    if a.since:
+        panel = panel[panel[date_col] >= pd.Timestamp(a.since)]
+    if a.until:
+        panel = panel[panel[date_col] <= pd.Timestamp(a.until)]
+    panel = panel.dropna(subset=[date_col, "close"])
+    if panel.empty:
+        print("ERROR: no rows after filters.", file=sys.stderr)
+        return 5
+
+    panel = add_trailing_returns(panel, sym_col, date_col)
+    panel = compute_forward_target(panel, sym_col, date_col, horizon=a.horizon)
+    trailing = [c for c in panel.columns if c.endswith("d_past")]
+    signals = [c for c in (trailing + EXTENSION_FEATURES)
+               if c in panel.columns and c not in FORBIDDEN]
+    signals = list(dict.fromkeys(signals))
+
+    print("MODE: TARGET-CHECK (panel-only; no model/probs)")
+    print(f"  panel={a.panel}")
+    print(f"  rows={len(panel):,}  symbols={panel[sym_col].nunique()}  "
+          f"dates={panel[date_col].nunique()}  horizon={a.horizon}d  regime='{regime_col}'")
+    print(f"  recent-strength signals: {signals}")
+
+    if a.by_horizon:
+        horizons = [int(x) for x in str(a.horizons).split(",") if x.strip()]
+        predictors = [c for c in trailing if c in panel.columns] or signals[:3]
+        sweep = horizon_sweep(panel, date_col, sym_col, predictors, horizons, a.min_names)
+        print(f"\n=========== HORIZON SWEEP: corr(recent return, forward@H)  [<0 = reversion] ===========")
+        with pd.option_context("display.width", 200, "display.max_columns", 30,
+                               "display.float_format", lambda x: f"{x:+.3f}"):
+            print(sweep.to_string())
+        meanrow = sweep.mean(axis=0)
+        print("  MEAN over predictors: " + "  ".join(f"{h}={v:+.3f}" for h, v in meanrow.items()))
+        if len(meanrow):
+            best_h = meanrow.idxmin()
+            last_h = meanrow.index[-1]
+            print(f"  -> strongest reversion at {best_h} (corr {meanrow.min():+.3f}); "
+                  f"by {last_h} corr={meanrow.loc[last_h]:+.3f}. Negative-shrinking-to-zero "
+                  f"across H is the short-term-reversal signature; the holding period where "
+                  f"corr is most negative is where the edge is strongest.")
+        sweep.to_csv(Path(a.out_dir) / "model_character_horizon_sweep.csv")
+        print(f"  written: {Path(a.out_dir) / 'model_character_horizon_sweep.csv'}")
+
+    res = target_reversion_check(panel, date_col, sym_col, regime_col, signals, a.min_names)
+    if res.empty:
+        print("ERROR: no cross-sectional observations (too few names/day?).", file=sys.stderr)
+        return 4
+    piv = res.pivot(index="signal", columns="group", values="corr_recent_vs_forward")
+    cols = ["ALL"] + [c for c in piv.columns if c != "ALL"]
+    piv = piv.reindex(columns=[c for c in cols if c in piv.columns])
+    print("\n=========== corr(recent-strength, FORWARD target)  [<0 = mean-reversion] ===========")
+    with pd.option_context("display.width", 200, "display.max_columns", 20,
+                           "display.float_format", lambda x: f"{x:+.3f}"):
+        print(piv.to_string())
+
+    overall = piv["ALL"].dropna()
+    agg = float(overall.mean()) if len(overall) else float("nan")
+    print("\n================ VERDICT (opportunity level) ================")
+    print(f"  mean corr(recent, forward) over {len(overall)} signals = {agg:+.3f}")
+    print(f"  -> {classify(agg)}")
+    if regime_col and regime_col in panel.columns:
+        per_reg = piv.drop(columns=["ALL"], errors="ignore").mean(axis=0)
+        if len(per_reg):
+            print(f"  most mean-reverting regime: {per_reg.idxmin()} ({per_reg.min():+.3f}); "
+                  f"least: {per_reg.idxmax()} ({per_reg.max():+.3f})")
+    print("  Reading: corr<0 means recent winners earn LOWER forward returns => the "
+          "OPPORTUNITY is short-term reversion, so a well-fit model on this target IS\n"
+          "  a mean-reversion model. (This is the data; it needs no model to measure.)")
+    out_csv = Path(a.out_dir) / "model_character_target_report.csv"
+    res.to_csv(out_csv, index=False)
+    print(f"\n  written: {out_csv}")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Is the model momentum or mean-reversion?")
     ap.add_argument("--scored", type=Path, default=None,
@@ -249,21 +401,45 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--symbol-col", default=None)
     ap.add_argument("--min-names", type=int, default=10,
                     help="min names per day to compute a cross-sectional corr")
+    ap.add_argument("--since", default=None, help="only analyse dates >= this (YYYY-MM-DD)")
+    ap.add_argument("--until", default=None, help="only analyse dates <= this (YYYY-MM-DD)")
+    ap.add_argument("--target-check", action="store_true",
+                    help="PANEL-ONLY mode: test whether the OPPORTUNITY is mean-reverting "
+                         "(corr of recent return vs forward target). Needs only --panel; "
+                         "no model/probabilities required. Runs automatically if no scored "
+                         "file is found.")
+    ap.add_argument("--horizon", type=int, default=5,
+                    help="forward horizon (days) for the target-check (default 5)")
+    ap.add_argument("--by-horizon", action="store_true",
+                    help="sweep multiple forward horizons (see --horizons) to show WHERE the "
+                         "reversion lives, e.g. strong at 1-5d and fading by 20d.")
+    ap.add_argument("--horizons", default="1,3,5,10,20",
+                    help="comma-separated forward horizons for --by-horizon (default 1,3,5,10,20)")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
 
     if a.self_test:
         return _run_self_test()
 
+    # ── Decide mode. If asked for a target-check, or no scored file exists but a
+    #    panel does, run the PANEL-ONLY opportunity-level reversion test. ──
     scored_path = a.scored
-    if scored_path is None:
-        for cand in (a.out_dir / "watchlist_5d_signal.csv", Path("watchlist_5d_signal.csv")):
+    if scored_path is None and not a.target_check:
+        for cand in (a.out_dir / "panel_scored.parquet", Path("panel_scored.parquet"),
+                     a.out_dir / "watchlist_5d_signal.csv", Path("watchlist_5d_signal.csv")):
             if cand.exists():
                 scored_path = cand
                 break
-    if scored_path is None or not Path(scored_path).exists():
-        print("ERROR: no scored file. Pass --scored <watchlist_5d_signal.csv or a "
-              "full-panel scored file>.", file=sys.stderr)
+    want_target = a.target_check or (scored_path is None)
+    if want_target:
+        if not a.panel or not Path(a.panel).exists():
+            print("ERROR: target-check needs --panel <panel_cache.parquet> (no model/probs "
+                  "required). Or provide --scored for the model-level check.", file=sys.stderr)
+            return 2
+        return _run_target_check(a)
+
+    if not Path(scored_path).exists():
+        print("ERROR: scored file not found.", file=sys.stderr)
         return 2
 
     df = _load_any(Path(scored_path))
@@ -278,6 +454,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 3
     df[date_col] = _norm_date(df[date_col])
     df[prob_col] = pd.to_numeric(df[prob_col], errors="coerce")
+
+    if a.since:
+        df = df[df[date_col] >= pd.Timestamp(a.since)]
+    if a.until:
+        df = df[df[date_col] <= pd.Timestamp(a.until)]
+    if df.empty:
+        print("ERROR: no rows after --since/--until filter.", file=sys.stderr)
+        return 5
 
     n_dates = df[date_col].nunique()
     print(f"Scored file: {scored_path}")
