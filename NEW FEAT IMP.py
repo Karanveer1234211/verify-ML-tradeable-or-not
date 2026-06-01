@@ -30,9 +30,13 @@ DROP / REVIEW recommendations were anchored to the wrong ground truth.
 
 v5 fixes all five and adds:
 
-  6. 5-fold purged time-series CV with embargo for permutation, so the
-     reported AUC drops are averaged across folds and the noise floor is
-     well-defined.
+  6. Out-of-time permutation: importance is permuted on a single, time-
+     respecting OUT-OF-TIME test split (last TEST_FRAC of dates, embargoed),
+     with PERM_SHUFFLES re-shuffles per feature. The reported std is therefore
+     SHUFFLE variance on that fixed window — NOT a fold-averaged noise floor.
+     Treat near-threshold KEEP/DROP calls as soft. (`purged_kfold_indices` is
+     provided if you want to wrap the permutation in true k-fold averaging; it
+     is intentionally NOT the default because it multiplies runtime by CV_FOLDS.)
   7. "Harmful feature" detection — features whose removal *improves*
      AUC (auc_drop < -0.0005 in 2+ regimes). These are dropped first.
   8. Feature family aggregation (D_, X_, W_, WQ_, M_, Comb_, regime_, ...)
@@ -57,9 +61,12 @@ OUTPUT FILES (written to OUT_DIR)
   feature_category_summary.csv           <- NEW: per-category rollup so you can
                                              pick the right features for a NEW model
   feature_importance_global.csv
+  feature_stability_by_year.csv
   feature_ic_by_year.csv
   regime_ic_summary.csv
-  regime_permutation_importance.csv      (mean + std across 5 shuffles)
+  feature_generalization.csv
+  feature_permutation_importance.csv
+  regime_permutation_importance.csv      (mean + std across PERM_SHUFFLES shuffles)
   regime_consistency.csv
   feature_correlation_matrix.csv
   feature_redundant_pairs.csv
@@ -89,8 +96,6 @@ from joblib import load
 from scipy.stats import spearmanr
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
-
-warnings.filterwarnings("ignore")
 
 warnings.filterwarnings("ignore")
 
@@ -826,8 +831,7 @@ def main(base_dir: Path):
             if m.sum() < 1000:
                 continue
             ic_map = spearman_ic_block(Xte_vals[m], FEATURES, ret_5d_te[m])
-            for feat in FEATURES:
-                regime_ic_df.loc[feat, f"ic_{r}"] = ic_map[feat]
+            regime_ic_df[f"ic_{r}"] = [ic_map[f] for f in FEATURES]   # whole column at once
     regime_ic_df = regime_ic_df.astype(float)
     regime_ic_df.to_csv(out_dir / "regime_ic_summary.csv")
 
