@@ -54,8 +54,11 @@ PANEL_PATH    = BASE_DIR / "panel_cache.parquet"
 FEATURES_JSON = BASE_DIR / "features_train.json"
 OUT_DIR       = BASE_DIR / "feature_factory"
 TMP_DIR       = OUT_DIR / "tmp_candidates"
-OUT_DIR.mkdir(exist_ok=True)
-TMP_DIR.mkdir(exist_ok=True)
+try:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass  # created lazily in main(); --self-test needs no output dir
 
 IST           = "Asia/Kolkata"
 RET_COL       = "ret_5d_oc_pct"
@@ -170,17 +173,27 @@ def _delay(s: pd.Series, d: int) -> pd.Series:
     return s.shift(d)
 
 
-def _rank(s: pd.Series) -> pd.Series:
-    return s.rank(pct=True)
+def _rank(s: pd.Series, min_periods: int = 60) -> pd.Series:
+    # LEAK-FREE per-symbol rank. _compute_wq_alphas runs on ONE symbol's full
+    # series, so the old s.rank(pct=True) ranked each row against that symbol's
+    # entire past AND FUTURE - a look-ahead leak (same class as the _rank_cs bug
+    # fixed in Daily cache v20). Expanding rank ranks s[t] only within s[0..t].
+    # NOTE: temporal per-symbol rank, NOT the WorldQuant cross-sectional rank;
+    # a true WQ rank must be computed at panel level (groupby date).
+    return s.expanding(min_periods=min_periods).rank(pct=True)
 
 
 def _signed_power(s: pd.Series, e: float) -> pd.Series:
     return np.sign(s) * (s.abs() ** e)
 
 
-def _scale(s: pd.Series) -> pd.Series:
-    denom = s.abs().sum()
-    return s / denom if denom != 0 else s
+def _scale(s: pd.Series, min_periods: int = 1) -> pd.Series:
+    # LEAK-FREE: the WorldQuant "scale" operator is cross-sectional (per day)
+    # in the literature. In this per-symbol generator the old s/s.abs().sum()
+    # divided every row by the FULL-series sum (incl. future) -> look-ahead.
+    # Use a CAUSAL expanding L1 norm: s[t] / sum(|s[0..t]|).
+    denom = s.abs().expanding(min_periods=min_periods).sum().replace(0, np.nan)
+    return s / denom
 
 
 # =============================================================================
@@ -977,6 +990,43 @@ def save_outputs(
 #                              MAIN
 # =============================================================================
 
+def _leak_canary(n: int = 400, k: int = 20, seed: int = 0) -> int:
+    """Leak self-test: tamper the FUTURE k rows, assert PAST WQ-alpha values are
+    unchanged. Generation is per-symbol, so any whole-series op (rank/scale/...)
+    would change past rows. Returns 0 on pass, 1 on leak."""
+    rng = np.random.default_rng(seed)
+    close = 100 * np.exp(np.cumsum(rng.normal(0, 0.02, n)))
+    op = close * (1 + rng.normal(0, 0.003, n))
+    hi = np.maximum(close, op) * (1 + np.abs(rng.normal(0, 0.005, n)))
+    lo = np.minimum(close, op) * (1 - np.abs(rng.normal(0, 0.005, n)))
+    vol = rng.integers(1e5, 2e6, n).astype(float)
+    base = pd.DataFrame({"date": pd.date_range("2020-01-01", periods=n, freq="B"),
+                         "symbol": "S", "open": op, "high": hi, "low": lo,
+                         "close": close, "volume": vol})
+    tamp = base.copy()
+    mlt = rng.uniform(0.3, 3.0, k)
+    for c in ["open", "high", "low", "close", "volume"]:
+        tamp.loc[n - k:, c] = tamp.loc[n - k:, c].to_numpy() * mlt
+    a = base.copy(); cols = _compute_wq_alphas(a)
+    b = tamp.copy(); _compute_wq_alphas(b)
+    wq = [c for c in cols if c.startswith("WQ_")]
+    leaks = []
+    for c in wq:
+        av = pd.to_numeric(a[c], errors="coerce").to_numpy()[:n - k]
+        bv = pd.to_numeric(b[c], errors="coerce").to_numpy()[:n - k]
+        an, bn = np.isnan(av), np.isnan(bv)
+        if not np.array_equal(an, bn):
+            leaks.append(c + "(nan)"); continue
+        d = float(np.nanmax(np.where(an, 0.0, np.abs(av - bv))) if (~an).any() else 0.0)
+        if d > 1e-9:
+            leaks.append(f"{c}({d:.1e})")
+    if leaks:
+        print(f"[leak-canary] FAIL - past WQ values changed when future tampered: {leaks}")
+        return 1
+    print(f"[leak-canary] PASS - {len(wq)} WQ alphas leak-free (future tampered, past unchanged)")
+    return 0
+
+
 def main():
     t0 = time.perf_counter()
     print("=" * 65)
@@ -1035,4 +1085,7 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys
+    if "--self-test" in sys.argv:
+        raise SystemExit(_leak_canary())
     main()
