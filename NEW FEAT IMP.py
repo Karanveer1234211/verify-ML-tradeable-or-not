@@ -68,6 +68,29 @@ OUTPUT FILES (written to OUT_DIR)
 CLI / CONFIG
 ------------
 Set BASE_DIR below or pass --base-dir on the command line.
+
+v5.1 — PARAMETRIC (multi-model / multi-horizon). Same vocabulary as strategy_lab
+(horizon, n_quantiles, use_model_target, embargo) so the upstream is uniform. The
+defaults reproduce the original 5d run byte-for-byte.
+
+  # default 5d run (unchanged behaviour, legacy output dir):
+  python "NEW FEAT IMP.py" --base-dir DIR
+
+  # scout a horizon you have NOT trained a model for yet (model-free: importance
+  # comes from a diagnostic model trained here on that horizon's label):
+  python "NEW FEAT IMP.py" --base-dir DIR --horizon 2 --model-free
+
+  # full model-anchored diagnostic for a specific trained model:
+  python "NEW FEAT IMP.py" --base-dir DIR --horizon 3 --model-path DIR/models/m3_classifier.joblib
+
+Flags: --horizon H | --quantiles Q (top/bottom = 1/Q) | --embargo D (default H+1)
+       --raw-target | --target-col COL | --ret-col COL | --model-path P | --model-free
+       --out-dir DIR (default <base>/feature_diagnostics[_<H>d])
+
+Model-anchored vs model-free: gain% and permutation AUC-drop require a model and
+are only meaningful for a model you actually built; the IC / regime-IC / category
+diagnostics are model-free and computable at any horizon for scouting which
+features suit a candidate (breakout / mean-reversion / ...) model.
 =============================================================================
 """
 
@@ -79,6 +102,7 @@ import re
 import time
 import warnings
 import zlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -142,6 +166,82 @@ REGIME_EXCEPTIONAL = 0.0030         # AUC drop in 1 regime above this = speciali
 CORR_THRESHOLD = 0.85
 PERM_SHUFFLES = 5                   # multi-shuffle permutation
 CV_FOLDS = 5
+
+
+# =============================================================================
+# CONFIG (parametric — multi-model / multi-horizon)
+#
+# The constants above remain the DEFAULTS so a plain `--base-dir DIR` run is
+# byte-for-byte the old 5d behaviour. This dataclass lets the same diagnostic
+# run at any horizon / target / model, with the SAME vocabulary as strategy_lab
+# (horizon, n_quantiles, use_model_target, embargo_days) so the upstream config
+# is uniform across the toolchain.
+#
+# Two modes:
+#   • model-anchored : a trained model is found/loaded -> gain% + permutation
+#                      AUC-drop come from THAT model (only valid for a model you
+#                      actually built).
+#   • model-free     : no model (or --model-free) -> the script trains its own
+#                      prod-matched diagnostic model for this horizon's label and
+#                      reports gain/permutation/IC against it. This is the SCOUT
+#                      mode for a horizon where you have not trained a model yet.
+# =============================================================================
+
+@dataclass
+class Config:
+    base_dir: Path = DEFAULT_BASE_DIR
+    horizon: int = 5                       # forward horizon in trading days
+    n_quantiles: int = 5                   # top/bottom = 1/n_quantiles (5 -> top20/bot20)
+    use_model_target: bool = True          # vol-adjusted forward return (model-style) vs raw
+    embargo_days: Optional[int] = None     # default = horizon + 1
+    target_col: Optional[str] = None       # override the derived label column name
+    ret_col: Optional[str] = None          # override the forward-return column name
+    model_path: Optional[Path] = None      # explicit model file (else auto-discover)
+    model_free: bool = False               # force the model-free (diagnostic-only) path
+    test_frac: float = TEST_FRAC
+    out_dir: Optional[Path] = None          # default = <base>/feature_diagnostics[_<H>d]
+
+    def embargo(self) -> int:
+        return int(self.embargo_days) if self.embargo_days is not None else int(self.horizon) + 1
+
+    def ret_col_name(self) -> str:
+        return self.ret_col or f"ret_{self.horizon}d_oc_pct"
+
+    def target_col_name(self) -> str:
+        return self.target_col or f"top20_vs_bot20_{self.horizon}d"
+
+    def label_q(self) -> float:
+        return 1.0 / float(max(2, self.n_quantiles))
+
+    def resolved_out_dir(self) -> Path:
+        if self.out_dir is not None:
+            return Path(self.out_dir)
+        base = Path(self.base_dir)
+        # preserve the legacy path for the default 5d run; suffix others so
+        # multi-horizon runs never clobber each other.
+        return base / "feature_diagnostics" if int(self.horizon) == 5 \
+            else base / f"feature_diagnostics_{self.horizon}d"
+
+
+def ensure_forward_return(panel: pd.DataFrame, ret_col: str, horizon: int) -> None:
+    """Guarantee `panel[ret_col]` (open[t+1]->close[t+h] %% return) exists.
+
+    Uses the precomputed column when present (so the default 5d run is unchanged);
+    otherwise computes it per-symbol so any horizon (incl. h=2, which the cache
+    does not precompute) works. Mutates `panel` in place."""
+    if ret_col in panel.columns:
+        s = pd.to_numeric(panel[ret_col], errors="coerce")
+        if s.notna().any():
+            return
+    g_close = panel.groupby("symbol", observed=True)["close"]
+    if "open" in panel.columns:
+        g_open = panel.groupby("symbol", observed=True)["open"]
+        fwd = (g_close.shift(-horizon) / g_open.shift(-1) - 1.0) * 100.0
+    else:
+        close = pd.to_numeric(panel["close"], errors="coerce")
+        fwd = (g_close.shift(-horizon) / close - 1.0) * 100.0
+    panel[ret_col] = fwd.replace([np.inf, -np.inf], np.nan).to_numpy()
+
 
 FEATURE_FAMILIES = [
     ("D_", "D"),       ("X_", "X"),       ("W_", "W"),
@@ -530,16 +630,29 @@ def get_lgb_booster(model):
 # Main
 # =============================================================================
 
-def main(base_dir: Path):
+def main(cfg: Config):
     print("=" * 70)
-    print("REGIME-AWARE FEATURE DIAGNOSTIC v5")
+    print("REGIME-AWARE FEATURE DIAGNOSTIC v5  (parametric)")
     print("=" * 70)
+
+    # ----- parametric locals (default == legacy 5d behaviour) -----
+    base_dir = Path(cfg.base_dir)
+    HORIZON = int(cfg.horizon)
+    RET_COL = cfg.ret_col_name()
+    TARGET_COL = cfg.target_col_name()
+    EMBARGO_DAYS = cfg.embargo()
+    TEST_FRAC = float(cfg.test_frac)
+    LABEL_Q = cfg.label_q()
+    print(f"[Cfg] horizon={HORIZON}d  target={TARGET_COL}  ret={RET_COL}  "
+          f"embargo={EMBARGO_DAYS}d  label_q={LABEL_Q:.2f}  "
+          f"vol_adj={cfg.use_model_target}  model_free={cfg.model_free}")
 
     panel_path = base_dir / "panel_cache.parquet"
     features_path = base_dir / "features_train.json"
     models_dir = base_dir / "models"
-    out_dir = base_dir / "feature_diagnostics"
-    out_dir.mkdir(exist_ok=True)
+    out_dir = cfg.resolved_out_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[Cfg] outputs -> {out_dir}")
 
     # -------------------------------------------------------------------------
     # Load
@@ -554,7 +667,7 @@ def main(base_dir: Path):
 
     # Project columns to keep memory in check (v5)
     needed_cols = list(set(FEATURES + [
-        "timestamp", "symbol", "close", "volume",
+        "timestamp", "symbol", "open", "close", "volume",
         RET_COL, TARGET_COL, "stock_regime", "D_atr14",
         "ret_5d_close_pct", "ret_3d_close_pct",
     ]))
@@ -628,39 +741,64 @@ def main(base_dir: Path):
     print(f"[Load] Universe filter: {pre_n:,} -> {len(panel):,} rows "
           f"(close>={MIN_CLOSE}, vol>={MIN_AVG20_VOL:,})")
 
-    # Load model
-    router_path = models_dir / "m5_regime_router.joblib"
-    ensemble_path = models_dir / "m5_ensemble.joblib"
-    cls_path = models_dir / "m5_classifier.joblib"
+    # -------------------------------------------------------------------------
+    # Load model (parametric + OPTIONAL). Order: explicit --model-path, then
+    # m{H}_* for this horizon, then legacy m5_*. If none found (or --model-free),
+    # run model-free: gain%/permutation come from the diagnostic model trained
+    # below on THIS horizon's label.
+    # -------------------------------------------------------------------------
     use_regime = False
     regime_models: Dict[str, object] = {}
     fallback_model = None
-    if router_path.exists():
-        print(f"[Load] Router: {router_path}")
-        router = load(router_path)
-        use_regime = True
-        fallback_model = getattr(router, "fallback", None)
-        regime_models = getattr(router, "regime_models", {}) or {}
-    elif ensemble_path.exists():
-        print(f"[Load] Ensemble: {ensemble_path}")
-        fallback_model = load(ensemble_path)
+    model_src = "model-free (diagnostic model only)"
+    if not cfg.model_free:
+        candidates: List[Path] = []
+        if cfg.model_path is not None:
+            candidates = [Path(cfg.model_path)]
+        else:
+            stems = [f"m{HORIZON}_regime_router", f"m{HORIZON}_ensemble", f"m{HORIZON}_classifier",
+                     "m5_regime_router", "m5_ensemble", "m5_classifier"]
+            candidates = [models_dir / f"{s}.joblib" for s in stems]
+        chosen = next((p for p in candidates if p.exists()), None)
+        if chosen is None:
+            print(f"[Load] No model found for horizon {HORIZON}d in {models_dir} "
+                  f"-> MODEL-FREE mode (importance from the diagnostic model).")
+        else:
+            print(f"[Load] Model: {chosen}")
+            obj = load(chosen)
+            model_src = chosen.name
+            if "router" in chosen.name:
+                use_regime = True
+                fallback_model = getattr(obj, "fallback", None)
+                regime_models = getattr(obj, "regime_models", {}) or {}
+            else:
+                fallback_model = obj
     else:
-        print(f"[Load] Single classifier: {cls_path}")
-        fallback_model = load(cls_path)
+        print("[Load] --model-free set -> importance from the diagnostic model.")
+    print(f"[Load] Importance source: {model_src}")
 
     # -------------------------------------------------------------------------
-    # Build target
+    # Build forward return + label for THIS horizon
     # -------------------------------------------------------------------------
+    ensure_forward_return(panel, RET_COL, HORIZON)
+
     if TARGET_COL not in panel.columns or panel[TARGET_COL].notna().sum() == 0:
-        print("[Target] Re-deriving top20_vs_bot20_5d from ret_5d_oc_pct + ATR%")
-        close = pd.to_numeric(panel["close"], errors="coerce")
-        r5 = pd.to_numeric(panel.get(RET_COL), errors="coerce")
-        atr_pct = (pd.to_numeric(panel.get("D_atr14"), errors="coerce") /
-                   close.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan) * 100.0
-        adj = r5 / atr_pct.replace(0, np.nan)
-        panel["rank_5d_pct"] = adj.groupby(panel["date"]).rank(method="average", pct=True)
-        panel[TARGET_COL] = np.where(panel["rank_5d_pct"] >= 0.80, 1,
-                                     np.where(panel["rank_5d_pct"] <= 0.20, 0, np.nan))
+        kind = "vol-adjusted" if cfg.use_model_target else "raw"
+        print(f"[Target] Deriving {TARGET_COL}: top/bottom {LABEL_Q:.0%} of the per-day "
+              f"{kind} forward {HORIZON}d return ({RET_COL}).")
+        rh = pd.to_numeric(panel.get(RET_COL), errors="coerce")
+        if cfg.use_model_target:
+            close = pd.to_numeric(panel["close"], errors="coerce")
+            atr_pct = (pd.to_numeric(panel.get("D_atr14"), errors="coerce") /
+                       close.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan) * 100.0
+            basis = rh / atr_pct.replace(0, np.nan)
+        else:
+            basis = rh
+        rank_pct = basis.groupby(panel["date"]).rank(method="average", pct=True)
+        panel[TARGET_COL] = np.where(rank_pct >= 1.0 - LABEL_Q, 1,
+                                     np.where(rank_pct <= LABEL_Q, 0, np.nan))
+    else:
+        print(f"[Target] Using existing column {TARGET_COL} from panel.")
 
     labeled = panel[panel[TARGET_COL].notna()].copy().reset_index(drop=True)
     print(f"[Target] Labeled rows: {len(labeled):,}")
@@ -1441,6 +1579,27 @@ def _self_test() -> int:
         assert "breakout" in categorize(feat)[1], f"{feat} missing breakout tag"
     print("[test] category mapping: OK")
 
+    # Config derivation (parametric multi-horizon defaults)
+    c5 = Config()  # defaults -> legacy 5d behaviour
+    assert c5.horizon == 5 and c5.ret_col_name() == "ret_5d_oc_pct"
+    assert c5.target_col_name() == "top20_vs_bot20_5d"
+    assert c5.embargo() == 6 and abs(c5.label_q() - 0.20) < 1e-9
+    assert c5.resolved_out_dir().name == "feature_diagnostics"
+    c2 = Config(base_dir=Path("."), horizon=2)
+    assert c2.ret_col_name() == "ret_2d_oc_pct" and c2.embargo() == 3
+    assert c2.resolved_out_dir().name == "feature_diagnostics_2d"
+    c3 = Config(horizon=3, n_quantiles=10, embargo_days=4)
+    assert abs(c3.label_q() - 0.10) < 1e-9 and c3.embargo() == 4
+    # forward-return fallback computes a column that doesn't exist
+    pf = pd.DataFrame({
+        "symbol": ["A"] * 8,
+        "open": np.arange(1, 9, dtype=float),
+        "close": np.arange(1, 9, dtype=float) * 1.01,
+    })
+    ensure_forward_return(pf, "ret_2d_oc_pct", 2)
+    assert "ret_2d_oc_pct" in pf.columns and pf["ret_2d_oc_pct"].notna().sum() >= 5
+    print("[test] Config derivation + forward-return fallback: OK")
+
     print("\nALL SELF-TESTS PASSED")
     return 0
 
@@ -1450,12 +1609,44 @@ def _self_test() -> int:
 # =============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Regime-aware feature diagnostic (parametric: multi-model / multi-horizon).")
     parser.add_argument("--base-dir", type=str, default=str(DEFAULT_BASE_DIR),
                         help="Directory containing panel_cache.parquet, features_train.json, models/")
+    parser.add_argument("--horizon", type=int, default=5, help="forward horizon in trading days")
+    parser.add_argument("--quantiles", type=int, default=5, dest="n_quantiles",
+                        help="top/bottom = 1/quantiles (5 -> top20/bot20); matches strategy_lab")
+    parser.add_argument("--embargo", type=int, default=None, dest="embargo_days",
+                        help="purged-CV embargo in days (default = horizon + 1)")
+    parser.add_argument("--raw-target", action="store_true",
+                        help="use raw forward return for the label instead of the vol-adjusted one")
+    parser.add_argument("--target-col", type=str, default=None,
+                        help="use an existing panel column as the label (overrides derivation)")
+    parser.add_argument("--ret-col", type=str, default=None,
+                        help="forward-return column name (default ret_<H>d_oc_pct)")
+    parser.add_argument("--model-path", type=str, default=None,
+                        help="explicit model .joblib (else auto-discover m<H>_* then m5_*)")
+    parser.add_argument("--model-free", action="store_true",
+                        help="ignore any trained model; importance from the diagnostic model "
+                             "(scout mode for a horizon you have not trained yet)")
+    parser.add_argument("--out-dir", type=str, default=None,
+                        help="output directory (default <base>/feature_diagnostics[_<H>d])")
     parser.add_argument("--self-test", action="store_true",
                         help="Validate fast-path numeric equivalence + categories on synthetic data; no real data needed")
     args = parser.parse_args()
     if args.self_test:
         raise SystemExit(_self_test())
-    main(Path(args.base_dir))
+
+    cfg = Config(
+        base_dir=Path(args.base_dir),
+        horizon=args.horizon,
+        n_quantiles=args.n_quantiles,
+        use_model_target=not args.raw_target,
+        embargo_days=args.embargo_days,
+        target_col=args.target_col,
+        ret_col=args.ret_col,
+        model_path=Path(args.model_path) if args.model_path else None,
+        model_free=args.model_free,
+        out_dir=Path(args.out_dir) if args.out_dir else None,
+    )
+    main(cfg)
