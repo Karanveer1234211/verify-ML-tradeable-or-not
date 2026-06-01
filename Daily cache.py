@@ -2259,30 +2259,58 @@ def build_daily(
             df = finalize_for_cache(df)
         return _save(df)
 
-    # Incremental
-    if schema_ok and cached_last is not None and not force:
-        fetch_start = cached_last + dt.timedelta(days=1)
-        fetch_end = end
-        if fetch_start > fetch_end:
-            return out_pq
+    # Incremental / in-place recompute.
+    # KEY: if we already have the bars on disk, NEVER re-download the whole
+    # history just because (a) a new trading day arrived or (b) the feature
+    # definitions changed (SCHEMA_VERSION bump). We recompute indicators in
+    # place (leak-free, no network) and fetch ONLY the missing tail — plus, if
+    # needed, backfill earlier warm-up history. So a schema bump costs a cheap
+    # recompute, not a full refetch. (Previously this was gated on schema_ok,
+    # so any version bump silently forced a full re-download of every symbol.)
+    # A true full download happens only on the first-ever build or with --force.
+    if out_pq.exists() and cached_last is not None and not force:
         base_df = _normalize_daily(read_parquet(out_pq))
-        inc_df = _normalize_daily(
-            provider.fetch_daily(symbol, fetch_start, fetch_end)
-        )
-        if inc_df.empty:
-            return out_pq
+        frames = [base_df]
+        fetched_any = False
+
+        # (a) backfill earlier warm-up history if the cache starts too late
+        if cached_first is not None and cached_first > warmup_start:
+            back_df = _normalize_daily(
+                provider.fetch_daily(
+                    symbol, warmup_start, cached_first - dt.timedelta(days=1)
+                )
+            )
+            if not back_df.empty:
+                frames.insert(0, back_df)
+                fetched_any = True
+
+        # (b) gap-fill the new tail
+        if cached_last < end:
+            inc_df = _normalize_daily(
+                provider.fetch_daily(symbol, cached_last + dt.timedelta(days=1), end)
+            )
+            if not inc_df.empty:
+                frames.append(inc_df)
+                fetched_any = True
+
         merged = (
-            pd.concat([base_df, inc_df], ignore_index=True)
+            pd.concat(frames, ignore_index=True)
             .drop_duplicates("timestamp", keep="last")
             .sort_values("timestamp")
             .reset_index(drop=True)
+            if len(frames) > 1 else base_df
         )
+
+        # Fast path: nothing new AND schema already current -> nothing to do.
+        if (not fetched_any) and schema_ok:
+            return out_pq
+
         _validate_monotonic(merged)
         merged = compute_daily_indicators(merged)
         merged = finalize_for_cache(merged)
         return _save(merged)
 
-    # Full fetch with warm-up backfill
+    # First-ever build (no usable cache on disk) or --force: full fetch + warm-up.
     extended_df = _normalize_daily(
         provider.fetch_daily(symbol, warmup_start, end)
     )
