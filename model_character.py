@@ -21,10 +21,13 @@ WHY THIS DESIGN
 
 INPUTS (all optional; sensible defaults)
   --scored   path to a scored file with a probability column + symbol + date.
-             Default: watchlist_5d_signal.csv in --out-dir or CWD.
-             A FULL-panel scored file (many dates) gives the most robust read;
-             the default watchlist is a single latest cross-section, which is
-             exactly the snapshot you were eyeballing.
+             Preferred: panel_scored.parquet (FULL panel — every symbol, every
+             day — written by New_model's export_full_panel_scores). This gives
+             a robust read across ALL history. If absent, falls back to
+             watchlist_5d_signal.csv, which is only the latest single
+             cross-section (the snapshot you were eyeballing).
+  --since / --until : restrict to a date range, e.g. the embargoed TEST window
+             for a strictly leak-free read (panel_scored is scored in-sample).
   --panel    path to panel_cache.parquet (the enriched panel). Used to compute
              true trailing returns ret_{5,20,60}d_past. If omitted, the script
              falls back to the extension features already present in --scored.
@@ -249,6 +252,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--symbol-col", default=None)
     ap.add_argument("--min-names", type=int, default=10,
                     help="min names per day to compute a cross-sectional corr")
+    ap.add_argument("--since", default=None, help="only analyse dates >= this (YYYY-MM-DD)")
+    ap.add_argument("--until", default=None, help="only analyse dates <= this (YYYY-MM-DD)")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
 
@@ -257,13 +262,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     scored_path = a.scored
     if scored_path is None:
-        for cand in (a.out_dir / "watchlist_5d_signal.csv", Path("watchlist_5d_signal.csv")):
+        # Prefer the FULL-panel multi-day scores; fall back to the single-day watchlist.
+        for cand in (a.out_dir / "panel_scored.parquet", Path("panel_scored.parquet"),
+                     a.out_dir / "watchlist_5d_signal.csv", Path("watchlist_5d_signal.csv")):
             if cand.exists():
                 scored_path = cand
                 break
     if scored_path is None or not Path(scored_path).exists():
-        print("ERROR: no scored file. Pass --scored <watchlist_5d_signal.csv or a "
-              "full-panel scored file>.", file=sys.stderr)
+        print("ERROR: no scored file. Pass --scored <panel_scored.parquet (multi-day, "
+              "preferred) or watchlist_5d_signal.csv>.", file=sys.stderr)
         return 2
 
     df = _load_any(Path(scored_path))
@@ -278,6 +285,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 3
     df[date_col] = _norm_date(df[date_col])
     df[prob_col] = pd.to_numeric(df[prob_col], errors="coerce")
+
+    if a.since:
+        df = df[df[date_col] >= pd.Timestamp(a.since)]
+    if a.until:
+        df = df[df[date_col] <= pd.Timestamp(a.until)]
+    if df.empty:
+        print("ERROR: no rows after --since/--until filter.", file=sys.stderr)
+        return 5
 
     n_dates = df[date_col].nunique()
     print(f"Scored file: {scored_path}")
