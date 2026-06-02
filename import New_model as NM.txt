@@ -1,0 +1,14 @@
+import New_model as NM
+
+NM.TARGET_MODE          = "rank"     # learn on ALL rows
+NM.PRIMARY_ARCHITECTURE = "single"   # pooled model
+NM.MODEL_ARCHITECTURE   = "single"     # also trains specialists + writes the comparison
+
+NM.run_pipeline(
+    data_dir=r"C:\Users\karanvsi\Desktop\Pycharm\Cache\cache_daily_new",
+    out_dir =r"C:\Users\karanvsi\Desktop\Kite Connect\out_rank_single",
+    symbols_like=None, limit_files=None,
+    ev_target="oc", embargo_days=5, export_xlsx=False,
+)
+
+
