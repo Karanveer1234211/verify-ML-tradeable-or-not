@@ -1,0 +1,151 @@
+[Load+Engineer] 2365/2500 ( 94.6%) ETA 00:20 OK UNITEDTEA (+2805 rows)
+[Load+Engineer] 2366/2500 ( 94.6%) ETA 00:20 OK UNIVASTU (+1704 rows)
+[Load+Engineer] 2367/2500 ( 94.7%) ETA 00:20 OK UNIVCABLES (+2840 rows)
+[Load+Engineer] 2368/2500 ( 94.7%) ETA 00:20 OK UNOMINDA (+2847 rows)
+[Load+Engineer] 2369/2500 ( 94.8%) ETA 00:20 OK UPL (+2847 rows)
+[Load+Engineer] 2370/2500 ( 94.8%) ETA 00:19 OK URBANCO (+173 rows)
+[Load+Engineer] 2371/2500 ( 94.8%) ETA 00:19 OK URJA (+2246 rows)
+[Load+Engineer] 2372/2500 ( 94.9%) ETA 00:19 OK USHAMART (+2847 rows)
+[Load+Engineer] 2373/2500 ( 94.9%) ETA 00:19 OK UTIAMC (+1398 rows)
+[Load+Engineer] 2374/2500 ( 95.0%) ETA 00:19 OK UTKARSHBNK (+709 rows)
+[Load+Engineer] 2375/2500 ( 95.0%) ETA 00:19 OK UTLSOLAR (+130 rows)
+[Load+Engineer] 2376/2500 ( 95.0%) ETA 00:19 OK UTTAMSUGAR (+2847 rows)
+[Load+Engineer] 2377/2500 ( 95.1%) ETA 00:18 OK UYFINCORP (+411 rows)
+[Load+Engineer] 2378/2500 ( 95.1%) ETA 00:18 OK V2RETAIL (+2847 rows)
+[Load+Engineer] 2379/2500 ( 95.2%) ETA 00:18 OK VADILALIND (+2847 rows)
+[Load+Engineer] 2380/2500 ( 95.2%) ETA 00:18 OK VAIBHAVGBL (+2823 rows)
+[Load+Engineer] 2381/2500 ( 95.2%) ETA 00:18 OK VAISHALI (+2291 rows)
+[Load+Engineer] 2382/2500 ( 95.3%) ETA 00:18 OK VAKRANGEE (+2847 rows)
+[Load+Engineer] 2383/2500 ( 95.3%) ETA 00:17 OK VAL30IETF (+398 rows)
+[Load+Engineer] 2384/2500 ( 95.4%) ETA 00:17 OK VALIANTLAB (+653 rows)
+[Load+Engineer] 2385/2500 ( 95.4%) ETA 00:17 OK VALIANTORG (+1492 rows)
+[Load+Engineer] 2386/2500 ( 95.4%) ETA 00:17 OK VALUE (+43 rows)
+[Load+Engineer] 2387/2500 ( 95.5%) ETA 00:17 OK VARDHACRLC (+2847 rows)
+[Load+Engineer] 2388/2500 ( 95.5%) ETA 00:17 OK VARROC (+1955 rows)
+[Load+Engineer] 2389/2500 ( 95.6%) ETA 00:16 OK VASCONEQ (+2843 rows)
+[Load+Engineer] 2390/2500 ( 95.6%) ETA 00:16 OK VASWANI (+2768 rows)
+[Load+Engineer] 2391/2500 ( 95.6%) ETA 00:16 OK VBL (+2368 rows)
+[Load+Engineer] 2392/2500 ( 95.7%) ETA 00:16 OK VCL (+958 rows)
+[Load+Engineer] 2393/2500 ( 95.7%) ETA 00:16 OK VEDL (+2847 rows)
+[Load+Engineer] 2394/2500 ( 95.8%) ETA 00:16 OK VEEDOL (+2847 rows)
+[Load+Engineer] 2395/2500 ( 95.8%) ETA 00:15 OK VELJAN (+30 rows)
+[Load+Engineer] 2396/2500 ( 95.8%) ETA 00:15 OK VENKEYS (+2847 rows)
+[Load+Engineer] 2397/2500 ( 95.9%) ETA 00:15 OK VENTIVE (+352 rows)
+[Load+Engineer] 2398/2500 ( 95.9%) ETA 00:15 OK VENUSPIPES (+998 rows)
+[Load+Engineer] 2399/2500 ( 96.0%) ETA 00:15 OK VENUSREM (+2840 rows)
+[Load+Engineer] 2400/2500 ( 96.0%) ETA 00:17 OK VERANDA (+1026 rows)
+[Load+Engineer] 2401/2500 ( 96.0%) ETA 00:17 NO NEW ROWS VERTOZ
+[Load+Engineer] 2402/2500 ( 96.1%) ETA 00:17 NO NEW ROWS VESUVIUS
+[Load+Engineer] 2403/2500 ( 96.1%) ETA 00:16 NO NEW ROWS VETO
+[Load+Engineer] 2404/2500 ( 96.2%) ETA 00:16 NO NEW ROWS VGL
+[Load+Engineer] 2405/2500 ( 96.2%) ETA 00:16 NO NEW ROWS VGUARD
+[Load+Engineer] 2406/2500 ( 96.2%) ETA 00:16 NO NEW ROWS VHL
+[Load+Engineer] 2407/2500 ( 96.3%) ETA 00:16 NO NEW ROWS VIDHIING
+[Load+Engineer] 2408/2500 ( 96.3%) ETA 00:16 NO NEW ROWS VIDYAWIRES
+[Load+Engineer] 2409/2500 ( 96.4%) ETA 00:15 NO NEW ROWS VIJAYA
+[Load+Engineer] 2410/2500 ( 96.4%) ETA 00:15 NO NEW ROWS VIKRAMSOLR
+[Load+Engineer] 2411/2500 ( 96.4%) ETA 00:15 NO NEW ROWS VIKRAN
+[Load+Engineer] 2412/2500 ( 96.5%) ETA 00:15 NO NEW ROWS VIMTALABS
+[Load+Engineer] 2413/2500 ( 96.5%) ETA 00:15 NO NEW ROWS VINATIORGA
+[Load+Engineer] 2414/2500 ( 96.6%) ETA 00:14 NO NEW ROWS VINCOFE
+[Load+Engineer] 2415/2500 ( 96.6%) ETA 00:14 NO NEW ROWS VINDHYATEL
+[Load+Engineer] 2416/2500 ( 96.6%) ETA 00:14 NO NEW ROWS VINEETLAB
+[Load+Engineer] 2417/2500 ( 96.7%) ETA 00:14 NO NEW ROWS VINNY
+[Load+Engineer] 2418/2500 ( 96.7%) ETA 00:14 NO NEW ROWS VINYLINDIA
+[Load+Engineer] 2419/2500 ( 96.8%) ETA 00:14 NO NEW ROWS VIPCLOTHNG
+[Load+Engineer] 2420/2500 ( 96.8%) ETA 00:13 NO NEW ROWS VIPIND
+[Load+Engineer] 2421/2500 ( 96.8%) ETA 00:13 NO NEW ROWS VISAKAIND
+[Load+Engineer] 2422/2500 ( 96.9%) ETA 00:13 NO NEW ROWS VISASTEEL
+[Load+Engineer] 2423/2500 ( 96.9%) ETA 00:13 NO NEW ROWS VISHNU
+[Load+Engineer] 2424/2500 ( 97.0%) ETA 00:13 NO NEW ROWS VIVIDHA
+[Load+Engineer] 2425/2500 ( 97.0%) ETA 00:12 NO NEW ROWS VIYASH
+[Load+Engineer] 2426/2500 ( 97.0%) ETA 00:12 NO NEW ROWS VLSFINANCE
+[Load+Engineer] 2427/2500 ( 97.1%) ETA 00:12 NO NEW ROWS VMART
+[Load+Engineer] 2428/2500 ( 97.1%) ETA 00:12 NO NEW ROWS VMM
+[Load+Engineer] 2429/2500 ( 97.2%) ETA 00:12 NO NEW ROWS VMSTMT
+[Load+Engineer] 2430/2500 ( 97.2%) ETA 00:12 NO NEW ROWS VOLTAMP
+[Load+Engineer] 2431/2500 ( 97.2%) ETA 00:11 NO NEW ROWS VOLTAS
+[Load+Engineer] 2432/2500 ( 97.3%) ETA 00:11 NO NEW ROWS VPRPL
+[Load+Engineer] 2433/2500 ( 97.3%) ETA 00:11 NO NEW ROWS VRAJ
+[Load+Engineer] 2434/2500 ( 97.4%) ETA 00:11 NO NEW ROWS VRLLOG
+[Load+Engineer] 2435/2500 ( 97.4%) ETA 00:11 NO NEW ROWS VSSL
+[Load+Engineer] 2436/2500 ( 97.4%) ETA 00:11 NO NEW ROWS VSTIND
+[Load+Engineer] 2437/2500 ( 97.5%) ETA 00:10 NO NEW ROWS VSTL
+[Load+Engineer] 2438/2500 ( 97.5%) ETA 00:10 NO NEW ROWS VSTTILLERS
+[Load+Engineer] 2439/2500 ( 97.6%) ETA 00:10 NO NEW ROWS VTL
+[Load+Engineer] 2440/2500 ( 97.6%) ETA 00:10 NO NEW ROWS WAAREEENER
+[Load+Engineer] 2441/2500 ( 97.6%) ETA 00:10 NO NEW ROWS WAAREEINDO
+[Load+Engineer] 2442/2500 ( 97.7%) ETA 00:09 NO NEW ROWS WAAREERTL
+[Load+Engineer] 2443/2500 ( 97.7%) ETA 00:09 NO NEW ROWS WABAG
+[Load+Engineer] 2444/2500 ( 97.8%) ETA 00:09 NO NEW ROWS WAKEFIT
+[Load+Engineer] 2445/2500 ( 97.8%) ETA 00:09 NO NEW ROWS WALCHANNAG
+[Load+Engineer] 2446/2500 ( 97.8%) ETA 00:09 NO NEW ROWS WCIL
+[Load+Engineer] 2447/2500 ( 97.9%) ETA 00:09 NO NEW ROWS WEALTH
+[Load+Engineer] 2448/2500 ( 97.9%) ETA 00:08 NO NEW ROWS WEBELSOLAR
+[Load+Engineer] 2449/2500 ( 98.0%) ETA 00:08 NO NEW ROWS WEIZMANIND
+[Load+Engineer] 2450/2500 ( 98.0%) ETA 00:08 NO NEW ROWS WEL
+[Load+Engineer] 2451/2500 ( 98.0%) ETA 00:08 NO NEW ROWS WELCORP
+[Load+Engineer] 2452/2500 ( 98.1%) ETA 00:08 NO NEW ROWS WELENT
+[Load+Engineer] 2453/2500 ( 98.1%) ETA 00:08 NO NEW ROWS WELINV
+[Load+Engineer] 2454/2500 ( 98.2%) ETA 00:07 NO NEW ROWS WELSPLSOL
+[Load+Engineer] 2455/2500 ( 98.2%) ETA 00:07 NO NEW ROWS WELSPUNLIV
+[Load+Engineer] 2456/2500 ( 98.2%) ETA 00:07 NO NEW ROWS WENDT
+[Load+Engineer] 2457/2500 ( 98.3%) ETA 00:07 NO NEW ROWS WESTLIFE
+[Load+Engineer] 2458/2500 ( 98.3%) ETA 00:07 NO NEW ROWS WEWIN
+[Load+Engineer] 2459/2500 ( 98.4%) ETA 00:06 NO NEW ROWS WEWORK
+[Load+Engineer] 2460/2500 ( 98.4%) ETA 00:06 NO NEW ROWS WHEELS
+[Load+Engineer] 2461/2500 ( 98.4%) ETA 00:06 NO NEW ROWS WHIRLPOOL
+[Load+Engineer] 2462/2500 ( 98.5%) ETA 00:06 NO NEW ROWS WILLAMAGOR
+[Load+Engineer] 2463/2500 ( 98.5%) ETA 00:06 NO NEW ROWS WIMPLAST
+[Load+Engineer] 2464/2500 ( 98.6%) ETA 00:06 NO NEW ROWS WINDLAS
+[Load+Engineer] 2465/2500 ( 98.6%) ETA 00:05 NO NEW ROWS WINDMACHIN
+[Load+Engineer] 2466/2500 ( 98.6%) ETA 00:05 NO NEW ROWS WIPL
+[Load+Engineer] 2467/2500 ( 98.7%) ETA 00:05 NO NEW ROWS WIPRO
+[Load+Engineer] 2468/2500 ( 98.7%) ETA 00:05 NO NEW ROWS WOCKPHARMA
+[Load+Engineer] 2469/2500 ( 98.8%) ETA 00:05 NO NEW ROWS WONDERLA
+[Load+Engineer] 2470/2500 ( 98.8%) ETA 00:05 NO NEW ROWS WORTHPERI
+[Load+Engineer] 2471/2500 ( 98.8%) ETA 00:04 NO NEW ROWS WPIL
+[Load+Engineer] 2472/2500 ( 98.9%) ETA 00:04 NO NEW ROWS WSI
+[Load+Engineer] 2473/2500 ( 98.9%) ETA 00:04 NO NEW ROWS WSTCSTPAPR
+[Load+Engineer] 2474/2500 ( 99.0%) ETA 00:04 NO NEW ROWS XCHANGING
+[Load+Engineer] 2475/2500 ( 99.0%) ETA 00:04 NO NEW ROWS XELPMOC
+[Load+Engineer] 2476/2500 ( 99.0%) ETA 00:04 NO NEW ROWS XPROINDIA
+[Load+Engineer] 2477/2500 ( 99.1%) ETA 00:03 NO NEW ROWS XTGLOBAL
+[Load+Engineer] 2478/2500 ( 99.1%) ETA 00:03 NO NEW ROWS YASHO
+[Load+Engineer] 2479/2500 ( 99.2%) ETA 00:03 NO NEW ROWS YATHARTH
+[Load+Engineer] 2480/2500 ( 99.2%) ETA 00:03 NO NEW ROWS YATRA
+[Load+Engineer] 2481/2500 ( 99.2%) ETA 00:03 NO NEW ROWS YESBANK
+[Load+Engineer] 2482/2500 ( 99.3%) ETA 00:03 NO NEW ROWS YUKEN
+[Load+Engineer] 2483/2500 ( 99.3%) ETA 00:02 NO NEW ROWS ZAGGLE
+[Load+Engineer] 2484/2500 ( 99.4%) ETA 00:02 NO NEW ROWS ZEEL
+[Load+Engineer] 2485/2500 ( 99.4%) ETA 00:02 NO NEW ROWS ZEELEARN
+[Load+Engineer] 2486/2500 ( 99.4%) ETA 00:02 NO NEW ROWS ZENITHEXPO
+[Load+Engineer] 2487/2500 ( 99.5%) ETA 00:02 NO NEW ROWS ZENITHSTL
+[Load+Engineer] 2488/2500 ( 99.5%) ETA 00:02 NO NEW ROWS ZENSARTECH
+[Load+Engineer] 2489/2500 ( 99.6%) ETA 00:01 NO NEW ROWS ZENTEC
+[Load+Engineer] 2490/2500 ( 99.6%) ETA 00:01 NO NEW ROWS ZFCVINDIA
+[Load+Engineer] 2491/2500 ( 99.6%) ETA 00:01 NO NEW ROWS ZFSTEERING
+[Load+Engineer] 2492/2500 ( 99.7%) ETA 00:01 NO NEW ROWS ZIMLAB
+[Load+Engineer] 2493/2500 ( 99.7%) ETA 00:01 NO NEW ROWS ZODIAC
+[Load+Engineer] 2494/2500 ( 99.8%) ETA 00:01 NO NEW ROWS ZODIACLOTH
+[Load+Engineer] 2495/2500 ( 99.8%) ETA 00:00 NO NEW ROWS ZOTA
+[Load+Engineer] 2496/2500 ( 99.8%) ETA 00:00 NO NEW ROWS ZSARACOM
+[Load+Engineer] 2497/2500 ( 99.9%) ETA 00:00 NO NEW ROWS ZUARI
+[Load+Engineer] 2498/2500 ( 99.9%) ETA 00:00 NO NEW ROWS ZUARIIND
+[Load+Engineer] 2499/2500 (100.0%) ETA 00:00 NO NEW ROWS ZYDUSLIFE
+[Load+Engineer] 2500/2500 (100.0%) ETA 00:00 NO NEW ROWS ZYDUSWELL
+[Panel] Appended new rows: 4267824
+[Timing] panel read+sort: 562.2s  (rows=4,267,824)
+[Timing] cross-sectional regime features: 1.0s
+[Macro] WARNING: join failed: Unable to allocate 5.82 GiB for an array with shape (183, 4270925) and data type float64. Continuing without macro features.
+[Timing] macro join: 100.6s
+[Regime] Hard regime label lagged by 1 bar(s) per symbol (known before entry).
+[Regime] Per-stock regime distribution:
+          bull_trend       1,577,000  (36.95%)
+          bull_range         739,323  (17.32%)
+          bear_trend       1,124,616  (26.35%)
+          bear_range         826,885  (19.37%)
+[Timing] stock regime label + continuous features: 1.4s
+[Label] USE_STRICT_LABEL=False -> skipping strict follow-through label computation (saves a full-panel pass).
+[Panel Save] Rewriting enriched panel_cache.parquet (shape=(4267824, 207); +9 enriched cols incl. [])
+
