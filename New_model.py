@@ -582,6 +582,24 @@ class PanelParquetWriter:
         if not _PA_OK:
             raise SystemExit("pyarrow is required to write panel_cache.parquet. Please run: pip install pyarrow")
         self.out_path = out_path; self._writer = None; self._schema = None
+        # Frozen, ordered column list established from the FIRST chunk. Every later
+        # chunk is reindexed to this EXACT order so pyarrow's ParquetWriter (which
+        # requires byte-identical schema incl. field order on every write_table)
+        # never sees a mismatch. Without this, an unstable one-hot family (e.g. a
+        # chunk of symbols with no Thursday rows lacks DOW_4) shifts the column
+        # order and aborts the whole panel build mid-way.
+        self._cols: Optional[List[str]] = None
+
+    # One-hot families whose category set can legitimately vary chunk-to-chunk.
+    # We pin the FULL set so the frozen schema always contains every member and a
+    # chunk missing one just gets it back-filled (0) instead of changing the schema.
+    _FULL_ONEHOT_FAMILIES = (
+        [f"DOW_{i}" for i in range(7)]
+        + [f"CPR_Yday_{s}" for s in ("Above", "Below", "Inside", "Overlap")]
+        + [f"CPR_Tmr_{s}" for s in ("Above", "Below", "Inside", "Overlap")]
+        + [f"Struct_{s}" for s in ("uptrend", "downtrend", "range")]
+        + [f"DayType_{s}" for s in ("bullish", "bearish", "inside")]
+    )
     # AUDIT-FIX 1: include EVERY feature prefix that discover_daily_features
     # accepts so engineered features (X_*, W_*, WQ_*, Comb_*, DOW_*) are not
     # silently dropped on parquet write. M_* and regime_* are added to the
@@ -595,9 +613,27 @@ class PanelParquetWriter:
 
     def write_chunk(self, df: pd.DataFrame):
         if df is None or df.empty: return
-        dynamic_keep = list(dict.fromkeys(
-            MASTER_KEEP_STATIC + [c for c in df.columns if str(c).startswith(self._FEATURE_PREFIXES)]
-        ))
+        if self._cols is None:
+            # FIRST chunk: establish the frozen, ordered column set. Include every
+            # feature-prefixed column present PLUS the full one-hot families, so the
+            # schema is complete even if this first chunk happens to miss a category.
+            dynamic_keep = list(dict.fromkeys(
+                MASTER_KEEP_STATIC
+                + [c for c in df.columns if str(c).startswith(self._FEATURE_PREFIXES)]
+                + list(self._FULL_ONEHOT_FAMILIES)
+            ))
+            self._cols = dynamic_keep
+        else:
+            # LATER chunks: any brand-new feature column would change the schema and
+            # abort the writer. Such columns cannot be added to an open parquet file,
+            # so log + drop them rather than crash the whole build.
+            extra = [c for c in df.columns
+                     if str(c).startswith(self._FEATURE_PREFIXES) and c not in self._cols]
+            if extra:
+                print(f"[Panel] WARNING: dropping {len(extra)} late feature column(s) "
+                      f"absent from the frozen panel schema (cannot extend an open "
+                      f"parquet): {extra[:8]}{'...' if len(extra) > 8 else ''}")
+            dynamic_keep = self._cols
         for col in dynamic_keep:
             if col not in df.columns:
                 if str(col).startswith(self._ONEHOT_PREFIXES):
